@@ -1,0 +1,22 @@
+# Secrets and databases
+.env
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Working notes and old test protocols
+END_OF_DAY_CHECKLIST.md
+HOW_TO_CONTINUE_TOMORROW.md
+TEST_PROTOCOL.md
+TEST_PROTOCOL_V2.md
+TEST_PROTOCOL_V3.md
+PHASE1_INVESTIGATION_REPORT.md
+
+# Internal documentation (not for public repo)
+CLAUDE.md
+STATUS.md
+
+# Claude Code settings
+.claude/

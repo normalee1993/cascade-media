@@ -1,0 +1,11 @@
+services:
+  media-automation:
+    build: .
+    container_name: media-automation
+    restart: unless-stopped
+    ports:
+      - "${WEBHOOK_PORT:-9191}:${WEBHOOK_PORT:-9191}"
+    env_file:
+      - .env
+    volumes:
+      - /mnt/zpool/appdata/media-automation/data:/data
