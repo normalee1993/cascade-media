@@ -10,4 +10,4 @@ services:
     volumes:
       - /mnt/zpool/appdata/media-automation/data:/data
     labels:
-      net.unraid.docker.icon: "https://raw.githubusercontent.com/normalee1993/cascade-tv/main/logo.svg"
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/normalee1993/cascade-media/main/logo.svg"
