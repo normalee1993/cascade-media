@@ -43,6 +43,14 @@ def get_int_env(key, default):
         log.error(f"Invalid {key}='{os.getenv(key)}', must be an integer. Using default: {default}")
         return default
 
+def parse_env_list(key, default=""):
+    """Parse a comma-separated env var, stripping inline shell-style comments."""
+    raw = os.getenv(key, default)
+    comment_pos = raw.find('#')
+    if comment_pos >= 0:
+        raw = raw[:comment_pos]
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
 # Trakt API
 TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID", "")
 TRAKT_CLIENT_SECRET = os.getenv("TRAKT_CLIENT_SECRET", "")
@@ -53,7 +61,7 @@ TRAKT_DISCOVERY_ENABLED = os.getenv("TRAKT_DISCOVERY_ENABLED", "false").lower() 
 TRAKT_DISCOVERY_INTERVAL_HOURS = get_int_env("TRAKT_DISCOVERY_INTERVAL_HOURS", 6)
 TRAKT_DISCOVER_SHOWS = os.getenv("TRAKT_DISCOVER_SHOWS", "true").lower() == "true"
 TRAKT_DISCOVER_MOVIES = os.getenv("TRAKT_DISCOVER_MOVIES", "true").lower() == "true"
-TRAKT_LISTS = [s.strip() for s in os.getenv("TRAKT_LISTS", "recommended,watchlist,trending,popular,anticipated").split(",") if s.strip()]
+TRAKT_LISTS = parse_env_list("TRAKT_LISTS", "recommended,watchlist,trending,popular,anticipated")
 TRAKT_MIN_RATING = get_float_env("TRAKT_MIN_RATING", 7.0)
 TRAKT_MIN_VOTES = get_int_env("TRAKT_MIN_VOTES", 100)
 TRAKT_YEARS = os.getenv("TRAKT_YEARS", "").strip()
@@ -77,20 +85,33 @@ if TRAKT_YEARS:
         log.error(f"Invalid TRAKT_YEARS='{TRAKT_YEARS}', expected format: 2020-2026")
 
 # Genre exclusion (separate from TRAKT_GENRES inclusion filter)
-TRAKT_EXCLUDE_GENRES = [g.strip().lower() for g in os.getenv("TRAKT_EXCLUDE_GENRES", "").split(",") if g.strip()]
+TRAKT_EXCLUDE_GENRES = [g.lower() for g in parse_env_list("TRAKT_EXCLUDE_GENRES")]
 
-# TMDB (optional — enables episode count, show status, and content rating filters)
+# Content rating filters — use Trakt certification field, NO TMDB key required
+# TV: TV-Y, TV-Y7, TV-G, TV-PG, TV-14, TV-MA  |  Movie: G, PG, PG-13, R, NC-17
+FILTER_CONTENT_RATINGS = parse_env_list("FILTER_CONTENT_RATINGS")
+FILTER_EXCLUDE_CONTENT_RATINGS = parse_env_list("FILTER_EXCLUDE_CONTENT_RATINGS")
+
+# TMDB (optional — enables episode count, show status, show type, network, season filters)
+# ⚠ BREAKING CHANGE (v8): TRAKT_MAX_EPISODES → TMDB_MAX_EPISODES
+#                          TRAKT_ALLOWED_SHOW_STATUS → TMDB_ALLOWED_SHOW_STATUS
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
-TRAKT_MAX_EPISODES = get_int_env("TRAKT_MAX_EPISODES", 0)  # 0 = disabled
-TRAKT_ALLOWED_SHOW_STATUS = [s.strip() for s in os.getenv("TRAKT_ALLOWED_SHOW_STATUS", "").split(",") if s.strip()]
-TRAKT_ALLOWED_RATINGS = [r.strip() for r in os.getenv("TRAKT_ALLOWED_RATINGS", "").split(",") if r.strip()]
-TRAKT_EXCLUDE_RATINGS = [r.strip() for r in os.getenv("TRAKT_EXCLUDE_RATINGS", "").split(",") if r.strip()]
+TMDB_MAX_EPISODES = get_int_env("TMDB_MAX_EPISODES", 0)  # 0 = disabled
+TMDB_ALLOWED_SHOW_STATUS = parse_env_list("TMDB_ALLOWED_SHOW_STATUS")
+TMDB_EXCLUDE_SHOW_TYPES = parse_env_list("TMDB_EXCLUDE_SHOW_TYPES")
+TMDB_ALLOWED_NETWORKS = parse_env_list("TMDB_ALLOWED_NETWORKS")
+TMDB_MAX_SEASONS = get_int_env("TMDB_MAX_SEASONS", 0)  # 0 = disabled
+TMDB_ORIGINAL_LANGUAGE = parse_env_list("TMDB_ORIGINAL_LANGUAGE")  # e.g. ["en"] or ["en","ko"]
+
+# Seerr recheck — days before a skipped_exists record expires so auto-deleted content
+# (e.g. Jellysweep purges) can be re-discovered and re-requested. 0 = permanent.
+TRAKT_SEERR_RECHECK_DAYS = get_int_env("TRAKT_SEERR_RECHECK_DAYS", 365)
 
 # Premium content bypass (override year + show status filters for high-rated content)
 TRAKT_PREMIUM_BYPASS_ENABLED = os.getenv("TRAKT_PREMIUM_BYPASS_ENABLED", "true").lower() == "true"
 TRAKT_PREMIUM_BYPASS_MIN_RATING = get_float_env("TRAKT_PREMIUM_BYPASS_MIN_RATING", 8.0)
-TRAKT_PREMIUM_BYPASS_LISTS = [s.strip() for s in os.getenv("TRAKT_PREMIUM_BYPASS_LISTS", "recommended,watchlist").split(",") if s.strip()]
-TRAKT_PREMIUM_BYPASS_FILTERS = [s.strip() for s in os.getenv("TRAKT_PREMIUM_BYPASS_FILTERS", "year,status").split(",") if s.strip()]
+TRAKT_PREMIUM_BYPASS_LISTS = parse_env_list("TRAKT_PREMIUM_BYPASS_LISTS", "recommended,watchlist")
+TRAKT_PREMIUM_BYPASS_FILTERS = parse_env_list("TRAKT_PREMIUM_BYPASS_FILTERS", "year,status")
 
 # Seerr
 SEERR_URL = os.getenv("SEERR_URL", "")
@@ -103,6 +124,24 @@ DB_PATH = os.getenv("DB_PATH", "/data/media_automation.db")
 
 # Dry run
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+# Alert webhook — fires only on token refresh failure requiring manual re-auth
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
+
+# Token cache — avoids redundant refresh checks within a single discovery cycle
+_token_cache = {}  # Keys: 'token', 'cached_at'
+TOKEN_CACHE_TTL_SECONDS = 300
+
+# Permanently terminal actions — items with these actions are never re-evaluated.
+# skipped_exists is NOT listed here — it is handled separately with a time-based
+# expiry (TRAKT_SEERR_RECHECK_DAYS) so that auto-deleted content can be re-discovered.
+# All filter-based skips (skipped_year, skipped_genre, etc.) are intentionally absent —
+# they are re-evaluated each run so config changes take effect without a DB reset.
+TERMINAL_ACTIONS = frozenset({
+    "requested",        # Actually sent to Seerr — done
+    "skipped_watched",  # Trakt watch history is permanent
+    "skipped_no_tmdb",  # No TMDB ID — won't change
+})
 
 # ============================================================
 # HELPERS
@@ -200,6 +239,18 @@ def trakt_post(endpoint, data=None, headers_override=None):
     return _api_request_with_retry(requests.post, f"{TRAKT_BASE_URL}{endpoint}", headers, json=data)
 
 
+def _send_alert_webhook(message):
+    """Fire optional webhook alert on token failure. Supports Discord (content) and Slack (text)."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    payload = {"content": message, "text": message}
+    try:
+        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
+        log.info("Alert webhook sent")
+    except Exception as e:
+        log.warning(f"Alert webhook failed: {e}")
+
+
 def seerr_get(endpoint):
     """GET request to Seerr API."""
     return _api_request_with_retry(requests.get, f"{SEERR_URL}/api/v1{endpoint}", SEERR_HEADERS)
@@ -229,20 +280,17 @@ def tmdb_get(endpoint, params=None):
 
 
 def fetch_tmdb_details(media_type, tmdb_id):
-    """Fetch TMDB details with caching. Returns dict or None."""
+    """Fetch TMDB details with caching. Returns dict or None.
+    All required fields (type, networks, number_of_episodes, number_of_seasons, status)
+    are present in the base TMDB endpoint response — no append_to_response needed."""
     cache_key = f"{media_type}:{tmdb_id}"
     if cache_key in _tmdb_cache:
         return _tmdb_cache[cache_key]
 
-    if media_type == "show":
-        endpoint = f"/tv/{tmdb_id}"
-        params = {"append_to_response": "content_ratings"}
-    else:
-        endpoint = f"/movie/{tmdb_id}"
-        params = {"append_to_response": "release_dates"}
+    endpoint = f"/tv/{tmdb_id}" if media_type == "show" else f"/movie/{tmdb_id}"
 
     try:
-        data = tmdb_get(endpoint, params=params)
+        data = tmdb_get(endpoint)
         _tmdb_cache[cache_key] = data
         return data
     except Exception as e:
@@ -251,38 +299,21 @@ def fetch_tmdb_details(media_type, tmdb_id):
         return None
 
 
-def get_tmdb_content_rating(tmdb_data, media_type):
-    """Extract US content rating from TMDB data."""
-    if not tmdb_data:
-        return None
-
-    if media_type == "show":
-        ratings = tmdb_data.get("content_ratings", {}).get("results", [])
-        for r in ratings:
-            if r.get("iso_3166_1") == "US":
-                return r.get("rating")
-    else:
-        release_dates = tmdb_data.get("release_dates", {}).get("results", [])
-        for country in release_dates:
-            if country.get("iso_3166_1") == "US":
-                for release in country.get("release_dates", []):
-                    cert = release.get("certification")
-                    if cert:
-                        return cert
-    return None
-
 
 def check_tmdb_filters(media_type, tmdb_id, title):
-    """Check TMDB-based filters (episode count, show status, content rating).
+    """Check TMDB-based filters (episode count, show status, show type, networks, season count,
+    original language). Content rating is handled upstream using Trakt data — no TMDB call needed for it.
     Returns (passed, skip_reason) tuple."""
     if not TMDB_API_KEY:
         return True, None
 
     has_tmdb_filters = (
-        TRAKT_MAX_EPISODES > 0
-        or TRAKT_ALLOWED_SHOW_STATUS
-        or TRAKT_ALLOWED_RATINGS
-        or TRAKT_EXCLUDE_RATINGS
+        TMDB_MAX_EPISODES > 0
+        or TMDB_ALLOWED_SHOW_STATUS
+        or TMDB_EXCLUDE_SHOW_TYPES
+        or TMDB_ALLOWED_NETWORKS
+        or TMDB_MAX_SEASONS > 0
+        or TMDB_ORIGINAL_LANGUAGE
     )
     if not has_tmdb_filters:
         return True, None
@@ -292,29 +323,47 @@ def check_tmdb_filters(media_type, tmdb_id, title):
         return True, None  # Gracefully skip if TMDB data unavailable
 
     # Episode count filter (shows only)
-    if media_type == "show" and TRAKT_MAX_EPISODES > 0:
+    if media_type == "show" and TMDB_MAX_EPISODES > 0:
         episode_count = tmdb_data.get("number_of_episodes", 0)
-        if episode_count > TRAKT_MAX_EPISODES:
-            log.debug(f"Skipping '{title}' — {episode_count} episodes > {TRAKT_MAX_EPISODES}")
+        if episode_count > TMDB_MAX_EPISODES:
+            log.debug(f"Skipping '{title}' — {episode_count} episodes > {TMDB_MAX_EPISODES}")
             return False, "skipped_too_many_episodes"
 
     # Show status filter (shows only)
-    if media_type == "show" and TRAKT_ALLOWED_SHOW_STATUS:
+    if media_type == "show" and TMDB_ALLOWED_SHOW_STATUS:
         status = tmdb_data.get("status", "")
-        if status and status not in TRAKT_ALLOWED_SHOW_STATUS:
-            log.debug(f"Skipping '{title}' — status '{status}' not in allowed: {TRAKT_ALLOWED_SHOW_STATUS}")
+        if status and status not in TMDB_ALLOWED_SHOW_STATUS:
+            log.debug(f"Skipping '{title}' — status '{status}' not in allowed: {TMDB_ALLOWED_SHOW_STATUS}")
             return False, "skipped_show_status"
 
-    # Content rating filter
-    if TRAKT_ALLOWED_RATINGS or TRAKT_EXCLUDE_RATINGS:
-        rating = get_tmdb_content_rating(tmdb_data, media_type)
-        if rating:
-            if TRAKT_ALLOWED_RATINGS and rating not in TRAKT_ALLOWED_RATINGS:
-                log.debug(f"Skipping '{title}' — rating '{rating}' not in allowed: {TRAKT_ALLOWED_RATINGS}")
-                return False, "skipped_content_rating"
-            if TRAKT_EXCLUDE_RATINGS and rating in TRAKT_EXCLUDE_RATINGS:
-                log.debug(f"Skipping '{title}' — rating '{rating}' is excluded")
-                return False, "skipped_content_rating"
+    # Show type filter (shows only) — e.g. Scripted, Miniseries, Documentary, Reality, News, Talk Show
+    if media_type == "show" and TMDB_EXCLUDE_SHOW_TYPES:
+        show_type = tmdb_data.get("type", "")
+        if show_type and show_type in TMDB_EXCLUDE_SHOW_TYPES:
+            log.debug(f"Skipping '{title}' — show type '{show_type}' is excluded")
+            return False, "skipped_show_type"
+
+    # Networks filter (shows only) — pass through if network data is absent
+    if media_type == "show" and TMDB_ALLOWED_NETWORKS:
+        networks = [n.get("name", "") for n in tmdb_data.get("networks", [])]
+        if networks and not any(n in TMDB_ALLOWED_NETWORKS for n in networks):
+            log.debug(f"Skipping '{title}' — no allowed network in: {networks}")
+            return False, "skipped_network"
+
+    # Season count filter (shows only) — 0 seasons (unknown) passes through
+    if media_type == "show" and TMDB_MAX_SEASONS > 0:
+        season_count = tmdb_data.get("number_of_seasons", 0)
+        if season_count > TMDB_MAX_SEASONS:
+            log.debug(f"Skipping '{title}' — {season_count} seasons > {TMDB_MAX_SEASONS}")
+            return False, "skipped_too_many_seasons"
+
+    # Original language filter (shows AND movies) — checks TMDB original_language field.
+    # More accurate than TRAKT_LANGUAGES which reflects metadata/availability language.
+    if TMDB_ORIGINAL_LANGUAGE:
+        orig_lang = tmdb_data.get("original_language", "")
+        if orig_lang and orig_lang not in TMDB_ORIGINAL_LANGUAGE:
+            log.debug(f"Skipping '{title}' — original language '{orig_lang}' not in allowed: {TMDB_ORIGINAL_LANGUAGE}")
+            return False, "skipped_original_language"
 
     return True, None
 
@@ -386,10 +435,9 @@ def init_db():
 # ============================================================
 def save_tokens(conn, token_data):
     """Save OAuth tokens to database."""
-    now = datetime.now(timezone.utc).isoformat()
-    expires_at = datetime.fromtimestamp(
-        token_data["created_at"] + token_data["expires_in"], tz=timezone.utc
-    ).isoformat()
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=token_data["expires_in"])).isoformat()
+    now = now.isoformat()
 
     conn.execute("""
         INSERT OR REPLACE INTO trakt_tokens (id, access_token, refresh_token, expires_at, created_at)
@@ -426,29 +474,58 @@ def refresh_access_token(conn, refresh_token):
         return token_data["access_token"]
     except requests.exceptions.RequestException as e:
         log.error(f"Token refresh failed: {e}")
+        _send_alert_webhook(
+            f"Trakt token refresh FAILED: {e}\n"
+            "If the token is expired, re-authenticate with:\n"
+            "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+        )
         return None
 
 
 def get_valid_token(conn):
-    """Get a valid access token, refreshing if needed."""
+    """Get a valid access token, refreshing if needed. Cached per process run."""
+    # Return cached token if still fresh
+    if _token_cache.get("token") and _token_cache.get("cached_at"):
+        age = (datetime.now(timezone.utc) - _token_cache["cached_at"]).total_seconds()
+        if age < TOKEN_CACHE_TTL_SECONDS:
+            return _token_cache["token"]
+
     tokens = load_tokens(conn)
     if not tokens:
-        log.error("No Trakt tokens found. Run: python trakt_discovery.py auth")
+        log.error("No Trakt tokens found. Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
         return None
 
     expires_at = datetime.fromisoformat(tokens["expires_at"])
     now = datetime.now(timezone.utc)
+    days_left = (expires_at - now).days
 
-    # Refresh if within 7 days of expiry
-    if now >= expires_at - timedelta(days=7):
+    # Log-only expiry warnings (routine — not actionable failures, no webhook)
+    # Thresholds tuned for Trakt's 7-day access token lifecycle
+    if 0 < days_left <= 1:
+        log.error(f"Trakt token expires in {days_left} days — auto-refresh will attempt soon")
+    elif days_left <= 3:
+        log.warning(f"Trakt token expires in {days_left} days — will auto-refresh soon")
+
+    # Refresh if within 2 days of expiry (tuned for Trakt's 7-day access token lifecycle)
+    if now >= expires_at - timedelta(days=2):
         refreshed = refresh_access_token(conn, tokens["refresh_token"])
         if refreshed:
+            _token_cache["token"] = refreshed
+            _token_cache["cached_at"] = datetime.now(timezone.utc)
             return refreshed
         if now >= expires_at:
-            log.error("Token expired and refresh failed. Run: python trakt_discovery.py auth")
+            msg = (
+                "Trakt token EXPIRED and refresh FAILED. Re-authenticate with:\n"
+                "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+            )
+            log.error(msg)
+            _send_alert_webhook(msg)
             return None
 
-    return tokens["access_token"]
+    token = tokens["access_token"]
+    _token_cache["token"] = token
+    _token_cache["cached_at"] = datetime.now(timezone.utc)
+    return token
 
 
 def init_device_auth(conn):
@@ -544,15 +621,18 @@ def fetch_list(conn, list_type, media_type):
         endpoint = f"/recommendations/{media_type}s"
         params = {"extended": "full"}
     else:
-        # trending, popular, anticipated
+        # trending, popular, anticipated — server-side year filter is safe here
         endpoint = f"/{media_type}s/{list_type}"
         params = {"extended": "full", "limit": str(TRAKT_ITEMS_PER_LIST)}
+        if TRAKT_YEARS:
+            params["years"] = TRAKT_YEARS
 
-    # Add filters as query params
+    # Add remaining filters as query params (applied to all list types)
+    # Note: years is intentionally NOT sent to recommended/watchlist — those are
+    # personalised lists where the app-level year filter (with premium bypass) must
+    # own the gating. Sending years server-side would prevent bypass from ever firing.
     if TRAKT_GENRES:
         params["genres"] = TRAKT_GENRES
-    if TRAKT_YEARS:
-        params["years"] = TRAKT_YEARS
     if TRAKT_LANGUAGES:
         params["languages"] = TRAKT_LANGUAGES
 
@@ -596,15 +676,41 @@ def extract_item_info(item, media_type, list_type):
         "rating": media.get("rating", 0),
         "votes": media.get("votes", 0),
         "genres": [g.lower() for g in media.get("genres", [])],
+        "certification": media.get("certification"),  # e.g. "TV-MA", "PG-13" — present in extended=full
     }
 
 
 def is_already_discovered(conn, media_type, trakt_id):
-    """Check if an item has already been discovered (any source)."""
+    """Check if an item has been permanently handled or is within its Seerr recheck window.
+
+    Permanently blocked: actions in TERMINAL_ACTIONS (requested, skipped_watched, skipped_no_tmdb).
+    Time-gated: skipped_exists — re-evaluated after TRAKT_SEERR_RECHECK_DAYS so that content
+    deleted by auto-purge tools (e.g. Jellysweep) can be re-discovered and re-requested.
+    Filter-based skips (skipped_year, skipped_genre, etc.) are never blocking — they are
+    re-evaluated each run so config changes take effect without a DB reset.
+    """
+    # Phase 1: permanently terminal actions
+    placeholders = ",".join("?" * len(TERMINAL_ACTIONS))
     row = conn.execute(
-        "SELECT 1 FROM trakt_discovered WHERE media_type = ? AND trakt_id = ?",
-        (media_type, trakt_id)
+        f"SELECT 1 FROM trakt_discovered WHERE media_type = ? AND trakt_id = ? AND action IN ({placeholders})",
+        (media_type, trakt_id, *TERMINAL_ACTIONS)
     ).fetchone()
+    if row:
+        return True
+
+    # Phase 2: skipped_exists within recheck window
+    if TRAKT_SEERR_RECHECK_DAYS == 0:
+        # 0 = permanent — never re-check skipped_exists
+        row = conn.execute(
+            "SELECT 1 FROM trakt_discovered WHERE media_type = ? AND trakt_id = ? AND action = 'skipped_exists'",
+            (media_type, trakt_id)
+        ).fetchone()
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=TRAKT_SEERR_RECHECK_DAYS)).isoformat()
+        row = conn.execute(
+            "SELECT 1 FROM trakt_discovered WHERE media_type = ? AND trakt_id = ? AND action = 'skipped_exists' AND discovered_at > ?",
+            (media_type, trakt_id, cutoff)
+        ).fetchone()
     return row is not None
 
 
@@ -769,7 +875,22 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
             record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_genre", rating)
             return request_count
 
-    # TMDB-based filters (episode count, show status, content rating)
+    # Content rating filter — uses Trakt certification field, no TMDB key required
+    if FILTER_CONTENT_RATINGS or FILTER_EXCLUDE_CONTENT_RATINGS:
+        cert = info.get("certification")
+        if cert:
+            if FILTER_CONTENT_RATINGS and cert not in FILTER_CONTENT_RATINGS:
+                log.debug(f"Skipping '{title}' — content rating '{cert}' not in allowed: {FILTER_CONTENT_RATINGS}")
+                record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_content_rating", rating)
+                return request_count
+            if FILTER_EXCLUDE_CONTENT_RATINGS and cert in FILTER_EXCLUDE_CONTENT_RATINGS:
+                log.debug(f"Skipping '{title}' — content rating '{cert}' is excluded: {FILTER_EXCLUDE_CONTENT_RATINGS}")
+                record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_content_rating", rating)
+                return request_count
+        else:
+            log.debug(f"'{title}' — no certification in Trakt data, content rating filter skipped")
+
+    # TMDB-based filters (episode count, show status, show type, networks, season count)
     passed, skip_reason = check_tmdb_filters(media_type, tmdb_id, title)
     if not passed:
         if skip_reason == "skipped_show_status" and qualifies_for_premium_bypass(source, rating, "status"):
@@ -791,8 +912,11 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
 
     # Request via Seerr
     if request_via_seerr(media_type, tmdb_id, title):
-        record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "requested", rating)
-        record_request(conn, media_type, tmdb_id, title, source)
+        if not DRY_RUN:
+            # Don't write "requested" to DB during dry runs — items shown as "Would request"
+            # should not be permanently blocked from appearing in subsequent dry runs or live runs.
+            record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "requested", rating)
+            record_request(conn, media_type, tmdb_id, title, source)
         request_count += 1
         year_str = f" ({info['year']})" if info.get("year") else ""
         rating_str = f" [{rating:.1f}]" if rating else ""
@@ -846,8 +970,9 @@ def discover_content(conn):
     if DRY_RUN:
         log.info("[DRY RUN] No actual requests will be made")
 
-    # Clear TMDB cache for this cycle
+    # Clear per-cycle caches
     _tmdb_cache.clear()
+    _token_cache.clear()
 
     # Fetch watch history to skip already-watched content
     watched_ids = fetch_watched_ids(conn)
@@ -907,13 +1032,24 @@ def cmd_status(conn):
     if tokens:
         expires_at = datetime.fromisoformat(tokens["expires_at"])
         now = datetime.now(timezone.utc)
+        days_left = (expires_at - now).days
         if now < expires_at:
-            days_left = (expires_at - now).days
             print(f"Token: Valid ({days_left} days until expiry)")
+            if days_left <= 1:
+                print(f"  !! DANGER: expires in {days_left} days — re-auth may be needed soon")
+                print(f"  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+            elif days_left <= 3:
+                print(f"  Warning: expires in {days_left} days (auto-refresh will trigger soon)")
         else:
             print("Token: EXPIRED — run 'auth' to re-authenticate")
+            print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+        row = conn.execute("SELECT created_at FROM trakt_tokens WHERE id = 1").fetchone()
+        if row and row[0]:
+            last_refreshed = row[0][:19].replace("T", " ") + " UTC"
+            print(f"  Last refreshed: {last_refreshed}")
     else:
         print("Token: Not configured — run 'auth' to authenticate")
+        print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
 
     # Discovery stats
     row = conn.execute("SELECT COUNT(*) FROM trakt_discovered").fetchone()
@@ -928,7 +1064,7 @@ def cmd_status(conn):
     print(f"\nDiscovery Stats:")
     print(f"  Total discovered: {total_discovered}")
     print(f"  Total requested:  {total_requested}")
-    print(f"  Request log entries: {total_logged}")
+    print(f"  All-time request log: {total_logged}")
 
     # Breakdown by action
     rows = conn.execute(
@@ -939,14 +1075,14 @@ def cmd_status(conn):
         for action, count in rows:
             print(f"    {action}: {count}")
 
-    # Recent requests
+    # Recent requests (from trakt_discovered — consistent with reset)
     rows = conn.execute(
-        "SELECT media_type, title, source, requested_at FROM trakt_request_log ORDER BY requested_at DESC LIMIT 10"
+        "SELECT media_type, title, source, discovered_at FROM trakt_discovered WHERE action = 'requested' ORDER BY discovered_at DESC LIMIT 10"
     ).fetchall()
     if rows:
         print(f"\nRecent Requests:")
-        for media_type, title, source, requested_at in rows:
-            ts = requested_at[:19].replace("T", " ")
+        for media_type, title, source, discovered_at in rows:
+            ts = discovered_at[:19].replace("T", " ")
             print(f"  [{media_type}] {title} (from {source}) — {ts}")
 
 

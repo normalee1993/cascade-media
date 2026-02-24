@@ -7,6 +7,8 @@ import logging
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
@@ -36,9 +38,31 @@ PLAYBACK_SCRIPT_TIMEOUT = get_int_env("PLAYBACK_SCRIPT_TIMEOUT", 600)
 
 # Trakt discovery
 TRAKT_DISCOVERY_ENABLED = os.getenv("TRAKT_DISCOVERY_ENABLED", "false").lower() == "true"
-TRAKT_DISCOVERY_INTERVAL_HOURS = get_int_env("TRAKT_DISCOVERY_INTERVAL_HOURS", 6)
-TRAKT_DISCOVERY_INTERVAL = TRAKT_DISCOVERY_INTERVAL_HOURS * 3600
+TRAKT_DISCOVERY_TIME = os.getenv("TRAKT_DISCOVERY_TIME", "00:00")  # HH:MM local time
+TRAKT_DISCOVERY_TZ_NAME = os.getenv("TRAKT_DISCOVERY_TZ", "UTC")
+try:
+    TRAKT_DISCOVERY_TZ = ZoneInfo(TRAKT_DISCOVERY_TZ_NAME)
+except ZoneInfoNotFoundError:
+    logging.getLogger("scheduler").error(f"Invalid TRAKT_DISCOVERY_TZ='{TRAKT_DISCOVERY_TZ_NAME}', falling back to UTC")
+    TRAKT_DISCOVERY_TZ = ZoneInfo("UTC")
+    TRAKT_DISCOVERY_TZ_NAME = "UTC"
+try:
+    _h, _m = TRAKT_DISCOVERY_TIME.split(":")
+    TRAKT_DISCOVERY_HOUR = int(_h)
+    TRAKT_DISCOVERY_MINUTE = int(_m)
+except (ValueError, AttributeError):
+    logging.getLogger("scheduler").error(f"Invalid TRAKT_DISCOVERY_TIME='{TRAKT_DISCOVERY_TIME}', defaulting to 00:00")
+    TRAKT_DISCOVERY_HOUR, TRAKT_DISCOVERY_MINUTE = 0, 0
 TRAKT_SCRIPT_TIMEOUT = get_int_env("TRAKT_SCRIPT_TIMEOUT", 300)
+
+def next_discovery_run():
+    """Return the next datetime for the scheduled discovery time in the configured timezone."""
+    now = datetime.now(TRAKT_DISCOVERY_TZ)
+    target = now.replace(hour=TRAKT_DISCOVERY_HOUR, minute=TRAKT_DISCOVERY_MINUTE, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
 
 # Separate locks for polling vs webhook vs playback vs trakt processing
 poll_lock = threading.Lock()
@@ -236,16 +260,17 @@ def playback_check_loop():
 
 
 def trakt_discovery_loop():
-    """Background loop that runs Trakt discovery every N hours."""
-    log.info(f"Trakt discovery loop started (interval: {TRAKT_DISCOVERY_INTERVAL_HOURS}h)")
-    # Initial delay to let other services start
-    time.sleep(60)
+    """Background loop that runs Trakt discovery at a scheduled daily clock time (UTC)."""
+    log.info(f"Trakt discovery loop started (daily at {TRAKT_DISCOVERY_TIME} {TRAKT_DISCOVERY_TZ_NAME})")
     while True:
+        next_run = next_discovery_run()
+        wait = (next_run - datetime.now(TRAKT_DISCOVERY_TZ)).total_seconds()
+        log.info(f"Trakt discovery next run: {next_run.strftime('%Y-%m-%d %H:%M')} {TRAKT_DISCOVERY_TZ_NAME} ({wait/3600:.1f}h from now)")
+        time.sleep(wait)
         try:
             run_trakt_script(["discover"])
         except Exception as e:
             log.error(f"Error in Trakt discovery loop: {e}", exc_info=True)
-        time.sleep(TRAKT_DISCOVERY_INTERVAL)
 
 
 def main():
@@ -256,7 +281,10 @@ def main():
     log.info(f"  Script timeout: {SCRIPT_TIMEOUT}s")
     log.info(f"  Trakt discovery: {'enabled' if TRAKT_DISCOVERY_ENABLED else 'disabled'}")
     if TRAKT_DISCOVERY_ENABLED:
-        log.info(f"  Trakt discovery interval: {TRAKT_DISCOVERY_INTERVAL_HOURS}h")
+        next_run = next_discovery_run()
+        wait = (next_run - datetime.now(timezone.utc)).total_seconds()
+        log.info(f"  Trakt discovery schedule: daily at {TRAKT_DISCOVERY_TIME} {TRAKT_DISCOVERY_TZ_NAME}")
+        log.info(f"  Trakt next run: {next_run.strftime('%Y-%m-%d %H:%M')} {TRAKT_DISCOVERY_TZ_NAME} ({wait/3600:.1f}h from now)")
 
     # Start webhook server in background
     webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)

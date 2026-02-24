@@ -47,9 +47,10 @@ Each discovered item goes through these filters before being requested:
 4. **Vote threshold** — Skips items with fewer than `TRAKT_MIN_VOTES` (default: 100)
 5. **Year filter** — Skips items outside `TRAKT_YEARS` range (backup for API-level filter that some list types ignore)
 6. **Genre exclusion** — Skips items matching `TRAKT_EXCLUDE_GENRES` (e.g., `animation,reality,talk-show`)
-7. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TRAKT_MAX_EPISODES`), show status (`TRAKT_ALLOWED_SHOW_STATUS`), content rating (`TRAKT_ALLOWED_RATINGS` / `TRAKT_EXCLUDE_RATINGS`)
-8. **Already in Seerr** — Skips items already requested or available
-9. **Request limit** — Stops after per-type limits (`TRAKT_MAX_SHOW_REQUESTS` / `TRAKT_MAX_MOVIE_REQUESTS`)
+7. **Content rating** — `FILTER_CONTENT_RATINGS` (allow-list) and `FILTER_EXCLUDE_CONTENT_RATINGS` (deny-list) use Trakt's certification field directly — no `TMDB_API_KEY` required
+8. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TMDB_MAX_EPISODES`), show status (`TMDB_ALLOWED_SHOW_STATUS`), show type (`TMDB_EXCLUDE_SHOW_TYPES`), networks (`TMDB_ALLOWED_NETWORKS`), season count (`TMDB_MAX_SEASONS`), original language (`TMDB_ORIGINAL_LANGUAGE`)
+9. **Already in Seerr** — Skips items already requested or available
+10. **Request limit** — Stops after per-type limits (`TRAKT_MAX_SHOW_REQUESTS` / `TRAKT_MAX_MOVIE_REQUESTS`)
 
 ### Premium Content Bypass
 
@@ -63,6 +64,30 @@ High-rated content from personalised lists (`recommended`, `watchlist` by defaul
 | `TRAKT_PREMIUM_BYPASS_MIN_RATING` | `8.0` | Minimum rating to qualify for bypass (above the normal 7.0 floor) |
 | `TRAKT_PREMIUM_BYPASS_LISTS` | `recommended,watchlist` | Comma-separated list sources that get the bypass |
 | `TRAKT_PREMIUM_BYPASS_FILTERS` | `year,status` | Which filters are bypassable: `year`, `status`, or `year,status` |
+
+### TMDB Filters — Practical Notes
+
+TMDB filters run at **step 8**, after rating, votes, year, genre, and content rating checks. This means an item must survive all upstream filters before the TMDB lookup is even made. Keep this in mind when setting expectations:
+
+**`TMDB_EXCLUDE_SHOW_TYPES`**
+- **`Miniseries` is the most reliable value.** Limited series (Chernobyl, The Night Of, Ironheart, etc.) are common in Trakt trending/anticipated feeds and typically have high enough ratings to reach the TMDB check.
+- **`Reality`, `Documentary`, and `Talk Show` are better handled by `TRAKT_EXCLUDE_GENRES`** (e.g., `reality,talk-show,documentary`). Genre exclusion runs earlier in the pipeline (step 6 vs. step 8), requires no TMDB API key, and is more likely to block these shows — because Reality and Talk Show content rarely clears the default 7.0 rating / 100 vote thresholds and gets eliminated before ever reaching the TMDB lookup. Using both is fine; `TRAKT_EXCLUDE_GENRES` acts as the first line of defence.
+- **Syntax for values with spaces:** In your `.env` file, multi-word values like `Talk Show` are safe as-is — the entire line is read as a string:
+  ```
+  TMDB_EXCLUDE_SHOW_TYPES=Miniseries,Reality,Talk Show,Documentary
+  ```
+  No quoting needed in `.env`. Quoting is only required when passing the value inline in a shell command (e.g. `docker exec`).
+
+**`TMDB_ALLOWED_NETWORKS`**
+- This filter works reliably in production. Popular shows on mainstream networks (ABC, NBC, FOX, CBS, Hulu, etc.) do have high ratings and vote counts, so they routinely reach the TMDB check where they'll be blocked if their network isn't on your list.
+- Network names must match TMDB exactly, including spacing and capitalisation — e.g. `Apple TV+` not `Apple TV`, `The CW` not `CW`.
+- If a show has no network data in TMDB (rare), it passes through rather than being blocked.
+
+**`TMDB_ORIGINAL_LANGUAGE`**
+- Use this instead of (or alongside) `TRAKT_LANGUAGES` when you need to filter by actual production language. `TRAKT_LANGUAGES=en` filters at the API level but matches metadata language — a Korean drama with an English localisation can pass through. `TMDB_ORIGINAL_LANGUAGE=en` checks TMDB's `original_language` field, which reflects what language the show or film was actually produced in.
+- Uses ISO 639-1 two-letter codes: `en` (English), `ko` (Korean), `fr` (French), `ja` (Japanese), `de` (German), `es` (Spanish), `pt` (Portuguese), `zh` (Chinese).
+- This is the **only TMDB filter that applies to both shows and movies** — all other TMDB filters are shows-only.
+- If a TMDB record has no `original_language` value (extremely rare), the item passes through rather than being blocked.
 
 ### Setup
 1. Create a Trakt API application at https://trakt.tv/oauth/applications
@@ -174,11 +199,16 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TRAKT_GENRES` | | Genre inclusion filter (comma-separated, leave empty for all) |
 | `TRAKT_EXCLUDE_GENRES` | | Genre exclusion filter (comma-separated, e.g., `animation,reality,talk-show`) |
 | `TRAKT_YEARS` | | Year filter (e.g., `2020-2026`) — applied at both API and application level |
-| `TMDB_API_KEY` | | TMDB API key (enables episode count, show status, and content rating filters) |
-| `TRAKT_MAX_EPISODES` | `0` | Skip shows with more than this many episodes (0 = disabled, requires `TMDB_API_KEY`) |
-| `TRAKT_ALLOWED_SHOW_STATUS` | | Only allow shows with these statuses (e.g., `Returning Series,In Production,Planned`) |
-| `TRAKT_ALLOWED_RATINGS` | | Only allow these content ratings (e.g., `TV-14,TV-MA,PG-13,R`) |
-| `TRAKT_EXCLUDE_RATINGS` | | Exclude these content ratings (e.g., `TV-Y,TV-Y7,G`) |
+| `FILTER_CONTENT_RATINGS` | | Allow-list for content ratings using Trakt certification — no `TMDB_API_KEY` needed (e.g., `TV-14,TV-MA,PG-13,R`). TV values: `TV-Y`, `TV-Y7`, `TV-G`, `TV-PG`, `TV-14`, `TV-MA`. Movie values: `G`, `PG`, `PG-13`, `R`, `NC-17`. Empty = all ratings allowed. |
+| `FILTER_EXCLUDE_CONTENT_RATINGS` | | Deny-list for content ratings — blocks items with these ratings (e.g., `TV-Y,TV-Y7,G,PG`). Runs alongside the allow-list; either can block an item. |
+| `TMDB_API_KEY` | | TMDB API key (enables episode count, show status, show type, network, and season count filters — get a free key at https://www.themoviedb.org/settings/api) |
+| `TMDB_MAX_EPISODES` | `0` | Skip shows with more than this many total episodes (0 = disabled, requires `TMDB_API_KEY`) |
+| `TMDB_ALLOWED_SHOW_STATUS` | | Only allow shows with these statuses (comma-separated, requires `TMDB_API_KEY`). Values: `Returning Series`, `Planned`, `In Production`, `Ended`, `Canceled`, `Pilot`. Empty = all statuses allowed. |
+| `TMDB_EXCLUDE_SHOW_TYPES` | | Skip shows of these TMDB types (comma-separated, requires `TMDB_API_KEY`). Values: `Scripted`, `Miniseries`, `Documentary`, `Reality`, `News`, `Talk Show`. Note: values with spaces (e.g. `Talk Show`) are safe in `.env` — the whole line is read as-is. |
+| `TMDB_ALLOWED_NETWORKS` | | Only allow shows from these networks (comma-separated, requires `TMDB_API_KEY`). Examples: `HBO`, `Netflix`, `AMC`, `FX`, `Apple TV+`, `Hulu`, `Disney+`, `Showtime`. |
+| `TMDB_MAX_SEASONS` | `0` | Skip shows with more than this many seasons (0 = disabled, requires `TMDB_API_KEY`). Complements `TMDB_MAX_EPISODES` — use one or both. |
+| `TMDB_ORIGINAL_LANGUAGE` | | Filter by original production language (comma-separated ISO 639-1 codes, requires `TMDB_API_KEY`). More accurate than `TRAKT_LANGUAGES` which uses metadata language. Applies to both shows and movies. Examples: `en`, `en,fr`, `ko,ja`. Empty = all languages allowed. |
+| `TRAKT_SEERR_RECHECK_DAYS` | `365` | Days before a `skipped_exists` record expires and the item is re-evaluated. Useful with auto-deletion tools (e.g. Jellysweep) — content deleted from your library will re-enter the discovery pipeline after this window and may be re-requested. `0` = permanent (never re-check). |
 | `TRAKT_PREMIUM_BYPASS_ENABLED` | `true` | Allow high-rated content from configured lists to bypass year/status filters |
 | `TRAKT_PREMIUM_BYPASS_MIN_RATING` | `8.0` | Minimum rating to qualify for bypass |
 | `TRAKT_PREMIUM_BYPASS_LISTS` | `recommended,watchlist` | List sources eligible for bypass |
