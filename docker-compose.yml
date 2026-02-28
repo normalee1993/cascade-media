@@ -8,6 +8,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /mnt/zpool/appdata/media-automation/data:/data
+      - ./data:/data
     labels:
       net.unraid.docker.icon: "https://raw.githubusercontent.com/normalee1993/cascade-media/main/logo.svg"
+      net.unraid.docker.managed: "true"

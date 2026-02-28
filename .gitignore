@@ -16,9 +16,16 @@ TEST_PROTOCOL_V3.md
 TEST_PROTOCOL_V4.md
 PHASE1_INVESTIGATION_REPORT.md
 
+# Personal helper/test scripts (hardcoded local paths, not for public users)
+reset-and-rebuild.sh
+verify-database.sh
+
 # Internal documentation (not for public repo)
 CLAUDE.md
 STATUS.md
 
 # Claude Code settings
 .claude/
+
+# macOS metadata (created when browsing the share from a Mac)
+.DS_Store
