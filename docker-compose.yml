@@ -1,6 +1,9 @@
 services:
   media-automation:
-    build: .
+    # Pull the pre-built image from GitHub Container Registry (recommended):
+    image: ghcr.io/normalee1993/cascade-media:latest
+    # To build from source instead (development), comment out image: above and uncomment:
+    # build: .
     container_name: media-automation
     restart: unless-stopped
     ports:

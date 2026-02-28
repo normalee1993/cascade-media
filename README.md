@@ -155,7 +155,7 @@ Fill in your actual values for the API keys and service URLs.
 ### 4. Build and Run
 
 ```bash
-docker compose build && docker compose up -d
+docker compose pull && docker compose up -d
 ```
 
 ## Environment Variables
@@ -299,10 +299,10 @@ Logs what changes would be made without actually modifying anything.
 docker exec media-automation python /app/media_automation.py help
 ```
 
-## Rebuild After Code Changes
+## Update to Latest Version
 
 ```bash
-docker compose build && docker compose up -d
+docker compose pull && docker compose up -d
 ```
 
 ## How the Database Works

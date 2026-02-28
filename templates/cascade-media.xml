@@ -1,0 +1,175 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>cascade-media</Name>
+  <Repository>ghcr.io/normalee1993/cascade-media:latest</Repository>
+  <Registry>https://ghcr.io/normalee1993/cascade-media</Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/normalee1993/cascade-media/issues</Support>
+  <Project>https://github.com/normalee1993/cascade-media</Project>
+  <Overview>Automated media management connecting Sonarr, Jellyfin, Seerr, and SABnzbd. Discovers trending and recommended content via Trakt and requests it through Seerr. For TV shows, downloads only the requested season — with progressive unlocking as people watch — so storage stays lean. Playback-aware: starting a preview episode immediately prioritises the next download in SABnzbd.</Overview>
+  <Category>MediaApp:Other Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/normalee1993/cascade-media/main/templates/cascade-media.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/normalee1993/cascade-media/main/logo.svg</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Automated media management for Unraid. Connects Sonarr, Jellyfin, Seerr, and SABnzbd. Discovers content via Trakt and uses progressive season downloading to keep storage lean. Full documentation: https://github.com/normalee1993/cascade-media</Description>
+  <Labels/>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- STORAGE                                                         -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Data Directory" Target="/data" Default="/mnt/user/appdata/cascade-media" Mode="rw" Description="Persistent storage for the SQLite database and Trakt OAuth tokens. Do not delete this path — Trakt tokens are stored here and will require re-authentication if lost." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/cascade-media</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- NETWORK PORT                                                    -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Webhook Port" Target="9191" Default="9191" Mode="tcp" Description="Port for incoming Sonarr webhooks. Must match the WEBHOOK_PORT variable below." Type="Port" Display="always" Required="true" Mask="false">9191</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- CORE SERVICES                                                   -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Sonarr URL" Target="SONARR_URL" Default="http://sonarr:8989" Mode="" Description="URL of your Sonarr instance. Use the container name if on the same Docker network (e.g. http://sonarr:8989), or use the IP:port of your server." Type="Variable" Display="always" Required="true" Mask="false">http://sonarr:8989</Config>
+
+  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Default="" Mode="" Description="Sonarr API key. Found at Settings > General > API Key." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+
+  <Config Name="Jellyfin URL" Target="JELLYFIN_URL" Default="http://jellyfin:8096" Mode="" Description="URL of your Jellyfin instance." Type="Variable" Display="always" Required="true" Mask="false">http://jellyfin:8096</Config>
+
+  <Config Name="Jellyfin API Key" Target="JELLYFIN_API_KEY" Default="" Mode="" Description="Jellyfin API key. Found at Dashboard > API Keys > New API Key." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+
+  <Config Name="Jellyfin User IDs" Target="JELLYFIN_USER_IDS" Default="" Mode="" Description="Comma-separated Jellyfin user IDs to monitor for watch progress. Find IDs at Dashboard > Users > click a user > the numeric ID is in the page URL." Type="Variable" Display="always" Required="true" Mask="false"></Config>
+
+  <Config Name="Seerr URL" Target="SEERR_URL" Default="http://seerr:5055" Mode="" Description="URL of your Overseerr or Jellyseerr instance." Type="Variable" Display="always" Required="true" Mask="false">http://seerr:5055</Config>
+
+  <Config Name="Seerr API Key" Target="SEERR_API_KEY" Default="" Mode="" Description="Seerr API key. Found at Settings > General > API Key. Required for season request detection — without it the script falls back to Season 1." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+
+  <Config Name="Seerr User ID" Target="SEERR_USER_ID" Default="" Mode="" Description="Numeric Seerr user ID to attribute Trakt discovery requests to. Find it at Settings > Users > Edit a user > the ID is in the page URL (e.g. /settings/users/16/edit = ID 16). Leave empty to use the API key owner (admin)." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+
+  <Config Name="SABnzbd URL" Target="SABNZBD_URL" Default="http://sabnzbd:8080" Mode="" Description="URL of your SABnzbd instance. Required for download priority management (E02 gets Force priority when a preview episode starts playing)." Type="Variable" Display="always" Required="false" Mask="false">http://sabnzbd:8080</Config>
+
+  <Config Name="SABnzbd API Key" Target="SABNZBD_API_KEY" Default="" Mode="" Description="SABnzbd API key. Found at Config > General > API Key." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- AUTOMATION SETTINGS                                             -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Watch Threshold" Target="WATCH_THRESHOLD" Default="0.75" Mode="" Description="Fraction of a season that must be watched before the next season unlocks automatically. 0.75 = 75%." Type="Variable" Display="always" Required="false" Mask="false">0.75</Config>
+
+  <Config Name="Poll Interval (minutes)" Target="RUN_INTERVAL_MINUTES" Default="15" Mode="" Description="How often the watch-progress polling loop runs, in minutes." Type="Variable" Display="always" Required="false" Mask="false">15</Config>
+
+  <Config Name="Webhook Port (env)" Target="WEBHOOK_PORT" Default="9191" Mode="" Description="Must match the Webhook Port mapping above. Change both together if you use a different port." Type="Variable" Display="always" Required="false" Mask="false">9191</Config>
+
+  <Config Name="Log Level" Target="LOG_LEVEL" Default="INFO" Mode="" Description="Logging verbosity. Options: DEBUG, INFO, WARNING, ERROR." Type="Variable" Display="always" Required="false" Mask="false">INFO</Config>
+
+  <Config Name="Dry Run" Target="DRY_RUN" Default="false" Mode="" Description="Set to true to log what would happen without making any changes. Safe for testing your configuration." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- ADVANCED AUTOMATION SETTINGS                                    -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="New Series Lookback (hours)" Target="NEW_SERIES_LOOKBACK_HOURS" Default="48" Mode="" Description="How far back to look for newly added series during the polling loop." Type="Variable" Display="advanced" Required="false" Mask="false">48</Config>
+
+  <Config Name="Run Catchup on Start" Target="RUN_CATCHUP_ON_START" Default="false" Mode="" Description="Process all existing Sonarr series on container start. Set to true for first-time setup to apply monitoring rules to series already in Sonarr." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="SABnzbd Queue Wait (seconds)" Target="SABNZBD_QUEUE_WAIT_SECONDS" Default="120" Mode="" Description="Seconds to wait for SABnzbd to queue a download before cancelling unwanted items." Type="Variable" Display="advanced" Required="false" Mask="false">120</Config>
+
+  <Config Name="Playback Check Interval (seconds)" Target="PLAYBACK_CHECK_INTERVAL" Default="45" Mode="" Description="How often to poll Jellyfin for active playback sessions." Type="Variable" Display="advanced" Required="false" Mask="false">45</Config>
+
+  <Config Name="Playback Script Timeout (seconds)" Target="PLAYBACK_SCRIPT_TIMEOUT" Default="600" Mode="" Description="Maximum time the playback check script is allowed to run before being killed." Type="Variable" Display="advanced" Required="false" Mask="false">600</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- TRAKT DISCOVERY — CORE                                          -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Trakt Client ID" Target="TRAKT_CLIENT_ID" Default="" Mode="" Description="Trakt API client ID. Create a free app at https://trakt.tv/oauth/applications — set Redirect URI to urn:ietf:wg:oauth:2.0:oob and leave checkin/scrobble unchecked." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+
+  <Config Name="Trakt Client Secret" Target="TRAKT_CLIENT_SECRET" Default="" Mode="" Description="Trakt API client secret from your app at https://trakt.tv/oauth/applications." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="Trakt Discovery Enabled" Target="TRAKT_DISCOVERY_ENABLED" Default="false" Mode="" Description="Enable automated daily Trakt content discovery. Requires Trakt Client ID and Secret. After first start, run: docker exec cascade-media python -u /app/trakt_discovery.py auth" Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+
+  <Config Name="Trakt Discovery Time" Target="TRAKT_DISCOVERY_TIME" Default="00:00" Mode="" Description="Time of day to run discovery in HH:MM 24-hour format, interpreted in TRAKT_DISCOVERY_TZ timezone." Type="Variable" Display="always" Required="false" Mask="false">00:00</Config>
+
+  <Config Name="Trakt Discovery Timezone" Target="TRAKT_DISCOVERY_TZ" Default="UTC" Mode="" Description="IANA timezone for TRAKT_DISCOVERY_TIME. Examples: America/Chicago, America/New_York, America/Los_Angeles, Europe/London, UTC." Type="Variable" Display="always" Required="false" Mask="false">UTC</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- TRAKT DISCOVERY — FILTERS                                       -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Discover TV Shows" Target="TRAKT_DISCOVER_SHOWS" Default="true" Mode="" Description="Include TV shows in Trakt discovery." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Discover Movies" Target="TRAKT_DISCOVER_MOVIES" Default="true" Mode="" Description="Include movies in Trakt discovery." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Trakt Lists" Target="TRAKT_LISTS" Default="recommended,watchlist,trending,popular,anticipated" Mode="" Description="Comma-separated Trakt lists to pull from, processed in this order. Personalised lists (recommended, watchlist) first ensures they get priority when request limits are hit. Options: recommended, watchlist, trending, popular, anticipated." Type="Variable" Display="advanced" Required="false" Mask="false">recommended,watchlist,trending,popular,anticipated</Config>
+
+  <Config Name="Min Trakt Rating" Target="TRAKT_MIN_RATING" Default="7.0" Mode="" Description="Skip items with a Trakt rating below this value. This is a hard floor — always enforced, even with premium bypass." Type="Variable" Display="advanced" Required="false" Mask="false">7.0</Config>
+
+  <Config Name="Min Vote Count" Target="TRAKT_MIN_VOTES" Default="100" Mode="" Description="Skip items with fewer than this many Trakt votes." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+
+  <Config Name="Year Filter" Target="TRAKT_YEARS" Default="" Mode="" Description="Restrict discovery to a release year range. Format: YYYY-YYYY (e.g. 2010-2026). Leave empty for all years." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Language Filter" Target="TRAKT_LANGUAGES" Default="en" Mode="" Description="ISO 639-1 language code(s) applied at the Trakt API level. This filters on metadata language — for production language use TMDB_ORIGINAL_LANGUAGE instead." Type="Variable" Display="advanced" Required="false" Mask="false">en</Config>
+
+  <Config Name="Genre Include Filter" Target="TRAKT_GENRES" Default="" Mode="" Description="Only discover items matching these genres (comma-separated lowercase). Leave empty for all genres." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Genre Exclude Filter" Target="TRAKT_EXCLUDE_GENRES" Default="" Mode="" Description="Skip items matching these genres (comma-separated lowercase). Common values: animation,reality,talk-show,game-show,news,soap." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Content Rating Allow-list" Target="FILTER_CONTENT_RATINGS" Default="" Mode="" Description="Only allow these content ratings (comma-separated). TV values: TV-Y,TV-Y7,TV-G,TV-PG,TV-14,TV-MA. Movie values: G,PG,PG-13,R,NC-17. Leave empty for all ratings. No TMDB key required." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Content Rating Block-list" Target="FILTER_EXCLUDE_CONTENT_RATINGS" Default="" Mode="" Description="Block items with these content ratings (comma-separated). Example: TV-Y,TV-Y7,G,PG to exclude children content. No TMDB key required." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Max Requests Per Cycle" Target="TRAKT_MAX_REQUESTS_PER_CYCLE" Default="10" Mode="" Description="Maximum new Seerr requests per discovery cycle. Split evenly between shows and movies unless per-type limits are set." Type="Variable" Display="advanced" Required="false" Mask="false">10</Config>
+
+  <Config Name="Max Show Requests Per Cycle" Target="TRAKT_MAX_SHOW_REQUESTS" Default="5" Mode="" Description="Maximum TV show requests per discovery cycle. Overrides the even split from TRAKT_MAX_REQUESTS_PER_CYCLE." Type="Variable" Display="advanced" Required="false" Mask="false">5</Config>
+
+  <Config Name="Max Movie Requests Per Cycle" Target="TRAKT_MAX_MOVIE_REQUESTS" Default="5" Mode="" Description="Maximum movie requests per discovery cycle. Overrides the even split from TRAKT_MAX_REQUESTS_PER_CYCLE." Type="Variable" Display="advanced" Required="false" Mask="false">5</Config>
+
+  <Config Name="Items Per List" Target="TRAKT_ITEMS_PER_LIST" Default="20" Mode="" Description="How many items to fetch from each Trakt list per discovery cycle." Type="Variable" Display="advanced" Required="false" Mask="false">20</Config>
+
+  <Config Name="Seerr Recheck Days" Target="TRAKT_SEERR_RECHECK_DAYS" Default="365" Mode="" Description="Days before a skipped-exists record expires so auto-deleted content (e.g. purged by Jellysweep) can re-enter the discovery pipeline. Set to 0 for permanent (never re-check)." Type="Variable" Display="advanced" Required="false" Mask="false">365</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- TRAKT DISCOVERY — PREMIUM BYPASS                                -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Premium Bypass Enabled" Target="TRAKT_PREMIUM_BYPASS_ENABLED" Default="true" Mode="" Description="Allow high-rated content from personalised lists to bypass year and show status filters. Example: Breaking Bad (2008, Ended, 9.3) passes through even with TRAKT_YEARS=2020-2026." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Premium Bypass Min Rating" Target="TRAKT_PREMIUM_BYPASS_MIN_RATING" Default="8.0" Mode="" Description="Minimum Trakt rating to qualify for the premium bypass. Must be above TRAKT_MIN_RATING." Type="Variable" Display="advanced" Required="false" Mask="false">8.0</Config>
+
+  <Config Name="Premium Bypass Lists" Target="TRAKT_PREMIUM_BYPASS_LISTS" Default="recommended,watchlist" Mode="" Description="Comma-separated list sources where high-rated items can bypass filters. Personalised lists only (recommended and watchlist) is the intended use." Type="Variable" Display="advanced" Required="false" Mask="false">recommended,watchlist</Config>
+
+  <Config Name="Premium Bypass Filters" Target="TRAKT_PREMIUM_BYPASS_FILTERS" Default="year,status" Mode="" Description="Which filters the premium bypass can override. Options: year, status, or year,status. Genre, rating floor, and episode count are always enforced regardless." Type="Variable" Display="advanced" Required="false" Mask="false">year,status</Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- TMDB FILTERS (optional — requires free TMDB API key)            -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="TMDB API Key" Target="TMDB_API_KEY" Default="" Mode="" Description="Optional TMDB API key. Unlocks episode count, show status, show type, network, season count, and original language filters. Get a free key at https://www.themoviedb.org/settings/api (free account required)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="TMDB Max Episodes" Target="TMDB_MAX_EPISODES" Default="0" Mode="" Description="Skip shows with more total episodes than this number. 0 = disabled. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+
+  <Config Name="TMDB Allowed Show Status" Target="TMDB_ALLOWED_SHOW_STATUS" Default="" Mode="" Description="Only allow shows with these statuses (comma-separated). Options: Returning Series,Planned,In Production,Ended,Canceled,Pilot. Leave empty for all statuses. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Exclude Show Types" Target="TMDB_EXCLUDE_SHOW_TYPES" Default="" Mode="" Description="Skip shows of these TMDB types (comma-separated). Options: Scripted,Miniseries,Documentary,Reality,News,Talk Show. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Allowed Networks" Target="TMDB_ALLOWED_NETWORKS" Default="" Mode="" Description="Only allow shows from these networks (comma-separated, exact TMDB spelling). Examples: HBO,Netflix,AMC,FX,Apple TV+,Hulu,Disney+,Showtime. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Max Seasons" Target="TMDB_MAX_SEASONS" Default="0" Mode="" Description="Skip shows with more seasons than this number. 0 = disabled. Complements TMDB_MAX_EPISODES. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+
+  <Config Name="TMDB Original Language" Target="TMDB_ORIGINAL_LANGUAGE" Default="" Mode="" Description="Filter by original production language (comma-separated ISO 639-1 codes). More accurate than TRAKT_LANGUAGES. Applies to both shows AND movies. Examples: en, en,fr, ko,ja. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- ALERTS                                                          -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Alert Webhook URL" Target="ALERT_WEBHOOK_URL" Default="" Mode="" Description="Optional Discord or Slack webhook URL. Fires ONLY on Trakt token refresh failure requiring manual re-authentication. Routine expiry warnings go to the container log only." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+</Container>
