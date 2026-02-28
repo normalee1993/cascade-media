@@ -185,7 +185,8 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TRAKT_CLIENT_ID` | | Trakt API client ID (from https://trakt.tv/oauth/applications) |
 | `TRAKT_CLIENT_SECRET` | | Trakt API client secret |
 | `TRAKT_DISCOVERY_ENABLED` | `false` | Enable/disable automated Trakt discovery loop |
-| `TRAKT_DISCOVERY_INTERVAL_HOURS` | `6` | How often the discovery loop runs |
+| `TRAKT_DISCOVERY_TIME` | `00:00` | Time of day to run discovery, in `HH:MM` 24-hour format (local time in `TRAKT_DISCOVERY_TZ`) |
+| `TRAKT_DISCOVERY_TZ` | `UTC` | IANA timezone for `TRAKT_DISCOVERY_TIME` (e.g. `America/Chicago`, `America/New_York`, `America/Los_Angeles`) |
 | `TRAKT_DISCOVER_SHOWS` | `true` | Discover TV shows |
 | `TRAKT_DISCOVER_MOVIES` | `true` | Discover movies |
 | `TRAKT_LISTS` | `recommended,watchlist,trending,popular,anticipated` | Which Trakt lists to check (processed in order; personalized lists first ensures they get priority) |

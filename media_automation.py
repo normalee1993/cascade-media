@@ -561,17 +561,28 @@ def process_new_series(conn, series):
         log.warning(f"Could not determine target season for {title}")
         return
 
-    # Wait for Sonarr to finish its initial processing before we override monitoring.
+    # Mark as processed immediately — before any waits or searches — so that
+    # the polling loop cannot race with the webhook subprocess and trigger a
+    # second identical Season search while this function is still running.
+    # (mark_season_unlocked is still called below, after searches complete.)
+    mark_series_processed(conn, series_id, title)
+
+    # Apply monitoring rules IMMEDIATELY to reduce the window in which Sonarr's
+    # auto-search can queue unwanted episodes. Sonarr begins searching for all
+    # monitored episodes as soon as a series is added — if we wait before setting
+    # monitoring, it will have already queued S2/S3 before we can stop it.
+    apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
+
+    # Also wait for Sonarr to finish its initial processing, then re-apply.
     # Sonarr's background tasks (episode import, auto-search) run after SeriesAdd
-    # and will re-monitor everything, undoing our changes if we're too early.
+    # and may re-monitor everything, undoing our changes. Re-applying after the
+    # wait ensures we correct any monitoring that Sonarr reset during processing.
     if not DRY_RUN:
         log.info(f"  Waiting 15s for Sonarr to finish initial processing...")
         time.sleep(15)
-        # Re-fetch episodes since Sonarr may have updated them
+        # Re-fetch and re-apply in case Sonarr re-monitored during initial processing
         episodes = sonarr_get(f"/episode?seriesId={series_id}")
-
-    # Apply monitoring rules
-    apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
+        apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
 
     # Trigger search ONLY for the target seasons (not the whole series)
     if not DRY_RUN:
@@ -603,7 +614,10 @@ def process_new_series(conn, series):
                         log.warning(f"  Failed to trigger E01 search for {title} S{sn:02d}: {e}")
 
     # Aggressive queue cleanup + re-apply monitoring in case Sonarr
-    # re-monitored episodes during search
+    # re-monitored episodes during search. All 3 passes always run — no early exit.
+    # Skipping passes based on "0 cancelled" is unsafe: 0 could mean downloads
+    # already completed (damage done) or not queued yet (pass too early). Always
+    # re-apply monitoring on each pass in case Sonarr reset it again.
     if not DRY_RUN:
         for delay in [10, 20, 30]:
             try:
@@ -611,14 +625,11 @@ def process_new_series(conn, series):
                 # Re-fetch and re-apply monitoring each pass
                 episodes = sonarr_get(f"/episode?seriesId={series_id}")
                 apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
-                cancelled = cleanup_unwanted_queue_items(series_id, title)
-                if cancelled == 0 and delay > 10:
-                    break  # No more items to clean up
+                cleanup_unwanted_queue_items(series_id, title)
             except Exception as e:
                 log.warning(f"  Cleanup pass failed: {e}")
 
-    # Mark as processed and unlock target seasons
-    mark_series_processed(conn, series_id, title)
+    # Unlock target seasons (series was already marked processed above)
     for sn in target_seasons:
         mark_season_unlocked(conn, series_id, sn, "initial_setup")
 
