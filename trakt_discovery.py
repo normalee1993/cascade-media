@@ -962,6 +962,7 @@ def _get_title(item, media_type):
 
 def _discover_sequential(conn, media_types, type_limits, type_counts, watched_ids):
     """Original sequential discovery — processes lists in TRAKT_LISTS order."""
+    processed_ids = set()
     for list_type in TRAKT_LISTS:
         all_done = all(type_counts[mt] >= type_limits[mt] for mt in media_types)
         if all_done:
@@ -978,6 +979,9 @@ def _discover_sequential(conn, media_types, type_limits, type_counts, watched_id
             for item in items:
                 if type_counts[media_type] >= type_limits[media_type]:
                     break
+                tid = _get_trakt_id(item, media_type)
+                if tid and (media_type, tid) in processed_ids:
+                    continue
                 try:
                     type_counts[media_type] = process_discovered_item(
                         conn, item, media_type, list_type,
@@ -987,6 +991,8 @@ def _discover_sequential(conn, media_types, type_limits, type_counts, watched_id
                 except Exception as e:
                     log.error(f"Error processing item: {e}", exc_info=True)
                     continue
+                if tid:
+                    processed_ids.add((media_type, tid))
 
 
 def _discover_two_pass(conn, media_types, type_limits, type_counts, watched_ids):
@@ -1092,6 +1098,8 @@ def _discover_two_pass(conn, media_types, type_limits, type_counts, watched_ids)
                 except Exception as e:
                     log.error(f"Error processing item: {e}", exc_info=True)
                     continue
+                if tid:
+                    processed_ids.add((media_type, tid))
 
 
 def discover_content(conn):
