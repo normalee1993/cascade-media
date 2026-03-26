@@ -72,6 +72,11 @@ TRAKT_MAX_SHOW_REQUESTS = get_int_env("TRAKT_MAX_SHOW_REQUESTS", 0)  # 0 = use T
 TRAKT_MAX_MOVIE_REQUESTS = get_int_env("TRAKT_MAX_MOVIE_REQUESTS", 0)  # 0 = use TRAKT_MAX_REQUESTS_PER_CYCLE
 TRAKT_ITEMS_PER_LIST = get_int_env("TRAKT_ITEMS_PER_LIST", 20)
 
+# Cross-list priority — process items appearing on both source and target lists first
+TRAKT_CROSS_LIST_PRIORITY = os.getenv("TRAKT_CROSS_LIST_PRIORITY", "true").lower() == "true"
+TRAKT_CROSS_LIST_SOURCES = parse_env_list("TRAKT_CROSS_LIST_SOURCES", "recommended,watchlist")
+TRAKT_CROSS_LIST_TARGETS = parse_env_list("TRAKT_CROSS_LIST_TARGETS", "trending")
+
 # Parse year range for application-level filtering (backup for API-level filter)
 TRAKT_YEAR_MIN = None
 TRAKT_YEAR_MAX = None
@@ -100,6 +105,7 @@ TMDB_MAX_EPISODES = get_int_env("TMDB_MAX_EPISODES", 0)  # 0 = disabled
 TMDB_ALLOWED_SHOW_STATUS = parse_env_list("TMDB_ALLOWED_SHOW_STATUS")
 TMDB_EXCLUDE_SHOW_TYPES = parse_env_list("TMDB_EXCLUDE_SHOW_TYPES")
 TMDB_ALLOWED_NETWORKS = parse_env_list("TMDB_ALLOWED_NETWORKS")
+TMDB_DISALLOWED_NETWORKS = parse_env_list("TMDB_DISALLOWED_NETWORKS")
 TMDB_MAX_SEASONS = get_int_env("TMDB_MAX_SEASONS", 0)  # 0 = disabled
 TMDB_ORIGINAL_LANGUAGE = parse_env_list("TMDB_ORIGINAL_LANGUAGE")  # e.g. ["en"] or ["en","ko"]
 
@@ -312,6 +318,7 @@ def check_tmdb_filters(media_type, tmdb_id, title):
         or TMDB_ALLOWED_SHOW_STATUS
         or TMDB_EXCLUDE_SHOW_TYPES
         or TMDB_ALLOWED_NETWORKS
+        or TMDB_DISALLOWED_NETWORKS
         or TMDB_MAX_SEASONS > 0
         or TMDB_ORIGINAL_LANGUAGE
     )
@@ -349,6 +356,14 @@ def check_tmdb_filters(media_type, tmdb_id, title):
         if networks and not any(n in TMDB_ALLOWED_NETWORKS for n in networks):
             log.debug(f"Skipping '{title}' — no allowed network in: {networks}")
             return False, "skipped_network"
+
+    # Disallowed networks filter (shows only) — inverse of allowed networks
+    if media_type == "show" and TMDB_DISALLOWED_NETWORKS:
+        networks = [n.get("name", "") for n in tmdb_data.get("networks", [])]
+        if networks and any(n in TMDB_DISALLOWED_NETWORKS for n in networks):
+            matched = [n for n in networks if n in TMDB_DISALLOWED_NETWORKS]
+            log.debug(f"Skipping '{title}' — disallowed network(s): {matched}")
+            return False, "skipped_disallowed_network"
 
     # Season count filter (shows only) — 0 seasons (unknown) passes through
     if media_type == "show" and TMDB_MAX_SEASONS > 0:
@@ -927,6 +942,158 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
     return request_count
 
 
+def _get_trakt_id(item, media_type):
+    """Extract trakt_id from a raw Trakt list item (lightweight, for indexing)."""
+    media_key = "show" if media_type == "show" else "movie"
+    if media_key in item:
+        return item[media_key].get("ids", {}).get("trakt")
+    elif "title" in item and "ids" in item:
+        return item.get("ids", {}).get("trakt")
+    return None
+
+
+def _get_title(item, media_type):
+    """Extract title from a raw Trakt item (for logging)."""
+    media_key = "show" if media_type == "show" else "movie"
+    if media_key in item:
+        return item[media_key].get("title", "Unknown")
+    return item.get("title", "Unknown")
+
+
+def _discover_sequential(conn, media_types, type_limits, type_counts, watched_ids):
+    """Original sequential discovery — processes lists in TRAKT_LISTS order."""
+    for list_type in TRAKT_LISTS:
+        all_done = all(type_counts[mt] >= type_limits[mt] for mt in media_types)
+        if all_done:
+            break
+
+        for media_type in media_types:
+            if type_counts[media_type] >= type_limits[media_type]:
+                continue
+
+            log.info(f"Fetching {list_type} {media_type}s...")
+            items = fetch_list(conn, list_type, media_type)
+            log.info(f"  Found {len(items)} items")
+
+            for item in items:
+                if type_counts[media_type] >= type_limits[media_type]:
+                    break
+                try:
+                    type_counts[media_type] = process_discovered_item(
+                        conn, item, media_type, list_type,
+                        type_counts[media_type], type_limits[media_type],
+                        watched_ids=watched_ids
+                    )
+                except Exception as e:
+                    log.error(f"Error processing item: {e}", exc_info=True)
+                    continue
+
+
+def _discover_two_pass(conn, media_types, type_limits, type_counts, watched_ids):
+    """Two-pass discovery: cross-list items first, then remaining items."""
+    source_set = set(TRAKT_CROSS_LIST_SOURCES)
+    target_set = set(TRAKT_CROSS_LIST_TARGETS)
+
+    # Phase 0: Fetch all lists upfront
+    fetched = {}
+    for list_type in TRAKT_LISTS:
+        for media_type in media_types:
+            log.info(f"Fetching {list_type} {media_type}s...")
+            items = fetch_list(conn, list_type, media_type)
+            log.info(f"  Found {len(items)} items")
+            fetched[(list_type, media_type)] = items
+
+    # Phase 1: Index items by trakt_id to find cross-list appearances
+    # item_index: (media_type, trakt_id) -> {"sources": [(list_type, item), ...]}
+    item_index = {}
+    for (list_type, media_type), items in fetched.items():
+        for item in items:
+            tid = _get_trakt_id(item, media_type)
+            if not tid:
+                continue
+            key = (media_type, tid)
+            if key not in item_index:
+                item_index[key] = {"sources": []}
+            item_index[key]["sources"].append((list_type, item))
+
+    # Identify cross-list items (on both a source list AND a target list)
+    cross_list_keys = []
+    for key, info in item_index.items():
+        list_types = {s[0] for s in info["sources"]}
+        has_source = bool(list_types & source_set)
+        has_target = bool(list_types & target_set)
+        if has_source and has_target:
+            cross_list_keys.append(key)
+
+    log.info(f"Cross-list priority: {len(cross_list_keys)} items appear on both source ({TRAKT_CROSS_LIST_SOURCES}) and target ({TRAKT_CROSS_LIST_TARGETS}) lists")
+
+    # Phase 2 (Pass 1): Process cross-list items
+    processed_ids = set()
+    for key in cross_list_keys:
+        media_type, trakt_id = key
+        if type_counts[media_type] >= type_limits[media_type]:
+            continue
+
+        info = item_index[key]
+        source_lists = {s[0] for s in info["sources"]}
+
+        # Pick the best source: first matching source list in TRAKT_LISTS order
+        preferred_source = None
+        preferred_item = None
+        for lt in TRAKT_LISTS:
+            if lt in (source_lists & source_set):
+                preferred_source = lt
+                for s_lt, s_item in info["sources"]:
+                    if s_lt == lt:
+                        preferred_item = s_item
+                        break
+                break
+
+        if not preferred_source:
+            continue
+
+        all_sources = sorted(source_lists)
+        title = _get_title(preferred_item, media_type)
+        log.info(f"  [CROSS-LIST] Processing '{title}' (on: {', '.join(all_sources)}, using source: {preferred_source})")
+
+        try:
+            type_counts[media_type] = process_discovered_item(
+                conn, preferred_item, media_type, preferred_source,
+                type_counts[media_type], type_limits[media_type],
+                watched_ids=watched_ids
+            )
+        except Exception as e:
+            log.error(f"Error processing cross-list item: {e}", exc_info=True)
+
+        processed_ids.add(key)
+
+    # Phase 3 (Pass 2): Process remaining items in original list order
+    for list_type in TRAKT_LISTS:
+        all_done = all(type_counts[mt] >= type_limits[mt] for mt in media_types)
+        if all_done:
+            break
+
+        for media_type in media_types:
+            if type_counts[media_type] >= type_limits[media_type]:
+                continue
+
+            for item in fetched.get((list_type, media_type), []):
+                if type_counts[media_type] >= type_limits[media_type]:
+                    break
+                tid = _get_trakt_id(item, media_type)
+                if tid and (media_type, tid) in processed_ids:
+                    continue
+                try:
+                    type_counts[media_type] = process_discovered_item(
+                        conn, item, media_type, list_type,
+                        type_counts[media_type], type_limits[media_type],
+                        watched_ids=watched_ids
+                    )
+                except Exception as e:
+                    log.error(f"Error processing item: {e}", exc_info=True)
+                    continue
+
+
 def discover_content(conn):
     """Main discovery orchestrator. Loops through configured lists and media types."""
     if not TRAKT_CLIENT_ID:
@@ -977,32 +1144,10 @@ def discover_content(conn):
     # Fetch watch history to skip already-watched content
     watched_ids = fetch_watched_ids(conn)
 
-    for list_type in TRAKT_LISTS:
-        # Check if all limits reached
-        all_done = all(type_counts[mt] >= type_limits[mt] for mt in media_types)
-        if all_done:
-            break
-
-        for media_type in media_types:
-            if type_counts[media_type] >= type_limits[media_type]:
-                continue
-
-            log.info(f"Fetching {list_type} {media_type}s...")
-            items = fetch_list(conn, list_type, media_type)
-            log.info(f"  Found {len(items)} items")
-
-            for item in items:
-                if type_counts[media_type] >= type_limits[media_type]:
-                    break
-                try:
-                    type_counts[media_type] = process_discovered_item(
-                        conn, item, media_type, list_type,
-                        type_counts[media_type], type_limits[media_type],
-                        watched_ids=watched_ids
-                    )
-                except Exception as e:
-                    log.error(f"Error processing item: {e}", exc_info=True)
-                    continue
+    if TRAKT_CROSS_LIST_PRIORITY:
+        _discover_two_pass(conn, media_types, type_limits, type_counts, watched_ids)
+    else:
+        _discover_sequential(conn, media_types, type_limits, type_counts, watched_ids)
 
     total = sum(type_counts.values())
     parts = [f"{mt}s: {type_counts[mt]}/{type_limits[mt]}" for mt in media_types]

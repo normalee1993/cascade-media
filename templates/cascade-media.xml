@@ -134,6 +134,12 @@
 
   <Config Name="Items Per List" Target="TRAKT_ITEMS_PER_LIST" Default="20" Mode="" Description="How many items to fetch from each Trakt list per discovery cycle." Type="Variable" Display="advanced" Required="false" Mask="false">20</Config>
 
+  <Config Name="Cross-List Priority" Target="TRAKT_CROSS_LIST_PRIORITY" Default="true" Mode="" Description="When enabled, items appearing on both a source list (e.g. recommended) AND a target list (e.g. trending) are processed first — these are the highest-confidence picks. Remaining download slots are filled from individual lists in order." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Cross-List Sources" Target="TRAKT_CROSS_LIST_SOURCES" Default="recommended,watchlist" Mode="" Description="Comma-separated lists that provide the 'personal signal' for cross-list priority. Items must also appear on a target list to qualify. Options: recommended, watchlist." Type="Variable" Display="advanced" Required="false" Mask="false">recommended,watchlist</Config>
+
+  <Config Name="Cross-List Targets" Target="TRAKT_CROSS_LIST_TARGETS" Default="trending" Mode="" Description="Comma-separated lists that provide the 'popularity signal' for cross-list priority. Items must also appear on a source list to qualify. Options: trending, popular, anticipated." Type="Variable" Display="advanced" Required="false" Mask="false">trending</Config>
+
   <Config Name="Seerr Recheck Days" Target="TRAKT_SEERR_RECHECK_DAYS" Default="365" Mode="" Description="Days before a skipped-exists record expires so auto-deleted content (e.g. purged by Jellysweep) can re-enter the discovery pipeline. Set to 0 for permanent (never re-check)." Type="Variable" Display="advanced" Required="false" Mask="false">365</Config>
 
   <!-- ═══════════════════════════════════════════════════════════════ -->
@@ -161,6 +167,8 @@
   <Config Name="TMDB Exclude Show Types" Target="TMDB_EXCLUDE_SHOW_TYPES" Default="" Mode="" Description="Skip shows of these TMDB types (comma-separated). Options: Scripted,Miniseries,Documentary,Reality,News,Talk Show. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
 
   <Config Name="TMDB Allowed Networks" Target="TMDB_ALLOWED_NETWORKS" Default="" Mode="" Description="Only allow shows from these networks (comma-separated, exact TMDB spelling). Examples: HBO,Netflix,AMC,FX,Apple TV+,Hulu,Disney+,Showtime. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Disallowed Networks" Target="TMDB_DISALLOWED_NETWORKS" Default="" Mode="" Description="Skip shows from these networks (comma-separated, exact TMDB spelling). Inverse of TMDB_ALLOWED_NETWORKS — blocks any show whose networks include a disallowed name. Examples: Netflix,Hulu,Disney+. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
 
   <Config Name="TMDB Max Seasons" Target="TMDB_MAX_SEASONS" Default="0" Mode="" Description="Skip shows with more seasons than this number. 0 = disabled. Complements TMDB_MAX_EPISODES. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
 

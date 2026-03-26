@@ -48,7 +48,7 @@ Each discovered item goes through these filters before being requested:
 5. **Year filter** — Skips items outside `TRAKT_YEARS` range (backup for API-level filter that some list types ignore)
 6. **Genre exclusion** — Skips items matching `TRAKT_EXCLUDE_GENRES` (e.g., `animation,reality,talk-show`)
 7. **Content rating** — `FILTER_CONTENT_RATINGS` (allow-list) and `FILTER_EXCLUDE_CONTENT_RATINGS` (deny-list) use Trakt's certification field directly — no `TMDB_API_KEY` required
-8. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TMDB_MAX_EPISODES`), show status (`TMDB_ALLOWED_SHOW_STATUS`), show type (`TMDB_EXCLUDE_SHOW_TYPES`), networks (`TMDB_ALLOWED_NETWORKS`), season count (`TMDB_MAX_SEASONS`), original language (`TMDB_ORIGINAL_LANGUAGE`)
+8. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TMDB_MAX_EPISODES`), show status (`TMDB_ALLOWED_SHOW_STATUS`), show type (`TMDB_EXCLUDE_SHOW_TYPES`), networks (`TMDB_ALLOWED_NETWORKS`, `TMDB_DISALLOWED_NETWORKS`), season count (`TMDB_MAX_SEASONS`), original language (`TMDB_ORIGINAL_LANGUAGE`)
 9. **Already in Seerr** — Skips items already requested or available
 10. **Request limit** — Stops after per-type limits (`TRAKT_MAX_SHOW_REQUESTS` / `TRAKT_MAX_MOVIE_REQUESTS`)
 
@@ -64,6 +64,20 @@ High-rated content from personalised lists (`recommended`, `watchlist` by defaul
 | `TRAKT_PREMIUM_BYPASS_MIN_RATING` | `8.0` | Minimum rating to qualify for bypass (above the normal 7.0 floor) |
 | `TRAKT_PREMIUM_BYPASS_LISTS` | `recommended,watchlist` | Comma-separated list sources that get the bypass |
 | `TRAKT_PREMIUM_BYPASS_FILTERS` | `year,status` | Which filters are bypassable: `year`, `status`, or `year,status` |
+
+### Cross-List Priority Discovery
+
+When enabled (default), items appearing on both a **source list** (e.g. `recommended`) and a **target list** (e.g. `trending`) are processed first — these are the highest-confidence picks because they combine personal recommendation with current popularity.
+
+After cross-list items are requested, remaining download slots are filled from individual lists in the normal `TRAKT_LISTS` order.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRAKT_CROSS_LIST_PRIORITY` | `true` | Enable/disable the two-pass system |
+| `TRAKT_CROSS_LIST_SOURCES` | `recommended,watchlist` | Lists providing the "personal signal" |
+| `TRAKT_CROSS_LIST_TARGETS` | `trending` | Lists providing the "popularity signal" |
+
+**How it works:** All configured lists are fetched upfront. Items found on both a source and target list are processed first (pass 1), using the source list for premium bypass eligibility. Remaining items are processed in the standard `TRAKT_LISTS` order (pass 2). Set `TRAKT_CROSS_LIST_PRIORITY=false` to revert to the original sequential behaviour.
 
 ### TMDB Filters — Practical Notes
 
@@ -82,6 +96,12 @@ TMDB filters run at **step 8**, after rating, votes, year, genre, and content ra
 - This filter works reliably in production. Popular shows on mainstream networks (ABC, NBC, FOX, CBS, Hulu, etc.) do have high ratings and vote counts, so they routinely reach the TMDB check where they'll be blocked if their network isn't on your list.
 - Network names must match TMDB exactly, including spacing and capitalisation — e.g. `Apple TV+` not `Apple TV`, `The CW` not `CW`.
 - If a show has no network data in TMDB (rare), it passes through rather than being blocked.
+
+**`TMDB_DISALLOWED_NETWORKS`**
+- Inverse of `TMDB_ALLOWED_NETWORKS` — blocks any show whose TMDB networks include a disallowed name.
+- Use this when you want to exclude a few specific networks rather than maintaining a large allow-list.
+- Can be used independently of `TMDB_ALLOWED_NETWORKS`. Combining both works — a show must not be on the disallowed list AND must be on the allowed list.
+- Same naming rules: network names must match TMDB exactly. Shows with no network data pass through.
 
 **`TMDB_ORIGINAL_LANGUAGE`**
 - Use this instead of (or alongside) `TRAKT_LANGUAGES` when you need to filter by actual production language. `TRAKT_LANGUAGES=en` filters at the API level but matches metadata language — a Korean drama with an English localisation can pass through. `TMDB_ORIGINAL_LANGUAGE=en` checks TMDB's `original_language` field, which reflects what language the show or film was actually produced in.
@@ -196,6 +216,9 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TRAKT_MAX_SHOW_REQUESTS` | | Max show requests per cycle (overrides even split) |
 | `TRAKT_MAX_MOVIE_REQUESTS` | | Max movie requests per cycle (overrides even split) |
 | `TRAKT_ITEMS_PER_LIST` | `20` | How many items to fetch per list |
+| `TRAKT_CROSS_LIST_PRIORITY` | `true` | Process items appearing on both a source and target list first (highest-confidence picks) |
+| `TRAKT_CROSS_LIST_SOURCES` | `recommended,watchlist` | Lists providing the "personal signal" for cross-list priority |
+| `TRAKT_CROSS_LIST_TARGETS` | `trending` | Lists providing the "popularity signal" for cross-list priority |
 | `TRAKT_LANGUAGES` | `en` | Language filter |
 | `TRAKT_GENRES` | | Genre inclusion filter (comma-separated, leave empty for all) |
 | `TRAKT_EXCLUDE_GENRES` | | Genre exclusion filter (comma-separated, e.g., `animation,reality,talk-show`) |
@@ -207,6 +230,7 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TMDB_ALLOWED_SHOW_STATUS` | | Only allow shows with these statuses (comma-separated, requires `TMDB_API_KEY`). Values: `Returning Series`, `Planned`, `In Production`, `Ended`, `Canceled`, `Pilot`. Empty = all statuses allowed. |
 | `TMDB_EXCLUDE_SHOW_TYPES` | | Skip shows of these TMDB types (comma-separated, requires `TMDB_API_KEY`). Values: `Scripted`, `Miniseries`, `Documentary`, `Reality`, `News`, `Talk Show`. Note: values with spaces (e.g. `Talk Show`) are safe in `.env` — the whole line is read as-is. |
 | `TMDB_ALLOWED_NETWORKS` | | Only allow shows from these networks (comma-separated, requires `TMDB_API_KEY`). Examples: `HBO`, `Netflix`, `AMC`, `FX`, `Apple TV+`, `Hulu`, `Disney+`, `Showtime`. |
+| `TMDB_DISALLOWED_NETWORKS` | | Skip shows from these networks (comma-separated, requires `TMDB_API_KEY`). Inverse of `TMDB_ALLOWED_NETWORKS`. Examples: `Netflix`, `Hulu`, `Disney+`. |
 | `TMDB_MAX_SEASONS` | `0` | Skip shows with more than this many seasons (0 = disabled, requires `TMDB_API_KEY`). Complements `TMDB_MAX_EPISODES` — use one or both. |
 | `TMDB_ORIGINAL_LANGUAGE` | | Filter by original production language (comma-separated ISO 639-1 codes, requires `TMDB_API_KEY`). More accurate than `TRAKT_LANGUAGES` which uses metadata language. Applies to both shows and movies. Examples: `en`, `en,fr`, `ko,ja`. Empty = all languages allowed. |
 | `TRAKT_SEERR_RECHECK_DAYS` | `365` | Days before a `skipped_exists` record expires and the item is re-evaluated. Useful with auto-deletion tools (e.g. Jellysweep) — content deleted from your library will re-enter the discovery pipeline after this window and may be re-requested. `0` = permanent (never re-check). |
