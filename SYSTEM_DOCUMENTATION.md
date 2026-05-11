@@ -289,7 +289,9 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 | `TMDB_ALLOWED_SHOW_STATUS` | "" | e.g., `Returning Series,Ended` |
 | `TMDB_EXCLUDE_SHOW_TYPES` | "" | e.g., `Reality,Talk Show` |
 | `TMDB_ALLOWED_NETWORKS` | "" | Network allow-list |
-| `TMDB_DISALLOWED_NETWORKS` | "" | Network deny-list |
+| `TMDB_DISALLOWED_NETWORKS` | "" | Network deny-list (originating network) |
+| `TMDB_DISALLOWED_PROVIDERS` | "" | Streaming provider deny-list (shows only, more robust — see below) |
+| `TMDB_PROVIDER_REGION` | `US` | ISO 3166-1 country code for watch provider lookup |
 | `TMDB_ORIGINAL_LANGUAGE` | "" | e.g., `en,ko` |
 
 #### Content Ratings (uses Trakt cert, no TMDB key needed)
@@ -386,6 +388,22 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 | Crunchyroll | `Crunchyroll` |
 
 > "HBO Max" was rebranded to "Max" on TMDB.
+> "Apple TV+" was rebranded to "Apple TV" on TMDB.
+
+### Networks vs Watch Providers
+
+Two filters target streaming services; they answer different questions and miss different things:
+
+| Filter | Source | What it checks | Matching | Misses |
+|--------|--------|----------------|----------|--------|
+| `TMDB_DISALLOWED_NETWORKS` | `tv.networks[]` | The show's *originating* broadcast network | Exact, case-sensitive | Shows distributed by streaming services but originating elsewhere (e.g. Bodyguard — BBC One on TMDB, Netflix in reality); also misses rebrand variants |
+| `TMDB_DISALLOWED_PROVIDERS` | `tv/{id}/watch/providers` `flatrate` | What's *currently streaming* the show in your region | Case-sensitive `startswith` | Anything not on a subscription tier in `TMDB_PROVIDER_REGION` (rent/buy providers are intentionally ignored) |
+
+The providers filter is **shows only** — movies are deliberately excluded because theatrical releases often have higher-quality non-streaming versions (UHD Blu-ray rips, theatrical remuxes) available even when the streaming version is on a subscription you have. You'd want those higher-quality versions in your library; the providers filter respects that.
+
+Both filters run if both are set. Either skip wins. Skip reasons recorded in `trakt_discovered.action`: `skipped_disallowed_network` and `skipped_disallowed_provider` respectively.
+
+Premium bypass (`TRAKT_PREMIUM_BYPASS_FILTERS`) does **not** apply to either — subscription overlap isn't quality-dependent.
 
 ---
 

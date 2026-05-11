@@ -166,9 +166,13 @@
 
   <Config Name="TMDB Exclude Show Types" Target="TMDB_EXCLUDE_SHOW_TYPES" Default="" Mode="" Description="Skip shows of these TMDB types (comma-separated). Options: Scripted,Miniseries,Documentary,Reality,News,Talk Show. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
 
-  <Config Name="TMDB Allowed Networks" Target="TMDB_ALLOWED_NETWORKS" Default="" Mode="" Description="Only allow shows from these networks (comma-separated, exact TMDB spelling). Examples: HBO,Netflix,AMC,FX,Apple TV+,Hulu,Disney+,Showtime. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+  <Config Name="TMDB Allowed Networks" Target="TMDB_ALLOWED_NETWORKS" Default="" Mode="" Description="Only allow shows from these networks (comma-separated, exact TMDB spelling). Examples: HBO,Netflix,AMC,FX,Apple TV,Hulu,Disney+,Showtime. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
 
-  <Config Name="TMDB Disallowed Networks" Target="TMDB_DISALLOWED_NETWORKS" Default="" Mode="" Description="Skip shows from these networks (comma-separated, exact TMDB spelling). Inverse of TMDB_ALLOWED_NETWORKS — blocks any show whose networks include a disallowed name. Examples: Netflix,Hulu,Disney+. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+  <Config Name="TMDB Disallowed Networks" Target="TMDB_DISALLOWED_NETWORKS" Default="" Mode="" Description="Skip shows from these networks (comma-separated, exact TMDB spelling). Inverse of TMDB_ALLOWED_NETWORKS — blocks any show whose networks include a disallowed name. Note: only checks originating network — for streaming distributors use TMDB_DISALLOWED_PROVIDERS. Examples: Netflix,Hulu,Disney+. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Disallowed Providers" Target="TMDB_DISALLOWED_PROVIDERS" Default="" Mode="" Description="Skip SHOWS currently streaming on these subscription providers in your region (TMDB Watch Providers). More reliable than TMDB_DISALLOWED_NETWORKS — catches streaming distributors (e.g. Bodyguard on Netflix) and survives network rebrands. Case-sensitive startswith match — 'Apple TV' catches 'Apple TV Amazon Channel' but 'Max' does NOT catch 'Cinemax'. Movies are unaffected. Examples: Netflix,Apple TV,HBO Max,Max,Disney Plus,Hulu,Amazon Prime Video. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="TMDB Provider Region" Target="TMDB_PROVIDER_REGION" Default="US" Mode="" Description="ISO 3166-1 country code for the Watch Providers lookup. Used by TMDB_DISALLOWED_PROVIDERS. Default US." Type="Variable" Display="advanced" Required="false" Mask="false">US</Config>
 
   <Config Name="TMDB Max Seasons" Target="TMDB_MAX_SEASONS" Default="0" Mode="" Description="Skip shows with more seasons than this number. 0 = disabled. Complements TMDB_MAX_EPISODES. Requires TMDB_API_KEY." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
 

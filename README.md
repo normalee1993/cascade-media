@@ -48,7 +48,7 @@ Each discovered item goes through these filters before being requested:
 5. **Year filter** — Skips items outside `TRAKT_YEARS` range (backup for API-level filter that some list types ignore)
 6. **Genre exclusion** — Skips items matching `TRAKT_EXCLUDE_GENRES` (e.g., `animation,reality,talk-show`)
 7. **Content rating** — `FILTER_CONTENT_RATINGS` (allow-list) and `FILTER_EXCLUDE_CONTENT_RATINGS` (deny-list) use Trakt's certification field directly — no `TMDB_API_KEY` required
-8. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TMDB_MAX_EPISODES`), show status (`TMDB_ALLOWED_SHOW_STATUS`), show type (`TMDB_EXCLUDE_SHOW_TYPES`), networks (`TMDB_ALLOWED_NETWORKS`, `TMDB_DISALLOWED_NETWORKS`), season count (`TMDB_MAX_SEASONS`), original language (`TMDB_ORIGINAL_LANGUAGE`)
+8. **TMDB filters** (optional, requires `TMDB_API_KEY`) — Episode count (`TMDB_MAX_EPISODES`), show status (`TMDB_ALLOWED_SHOW_STATUS`), show type (`TMDB_EXCLUDE_SHOW_TYPES`), networks (`TMDB_ALLOWED_NETWORKS`, `TMDB_DISALLOWED_NETWORKS`), **streaming providers** (`TMDB_DISALLOWED_PROVIDERS`, shows only — recommended over networks for catching streaming distributors), season count (`TMDB_MAX_SEASONS`), original language (`TMDB_ORIGINAL_LANGUAGE`)
 9. **Already in Seerr** — Skips items already requested or available
 10. **Request limit** — Stops after per-type limits (`TRAKT_MAX_SHOW_REQUESTS` / `TRAKT_MAX_MOVIE_REQUESTS`)
 
@@ -94,7 +94,7 @@ TMDB filters run at **step 8**, after rating, votes, year, genre, and content ra
 
 **`TMDB_ALLOWED_NETWORKS`**
 - This filter works reliably in production. Popular shows on mainstream networks (ABC, NBC, FOX, CBS, Hulu, etc.) do have high ratings and vote counts, so they routinely reach the TMDB check where they'll be blocked if their network isn't on your list.
-- Network names must match TMDB exactly, including spacing and capitalisation — e.g. `Apple TV+` not `Apple TV`, `The CW` not `CW`.
+- Network names must match TMDB exactly, including spacing and capitalisation — e.g. `Apple TV` not `Apple TV+` (TMDB dropped the `+` in a 2025 rebrand), `The CW` not `CW`.
 - If a show has no network data in TMDB (rare), it passes through rather than being blocked.
 
 **`TMDB_DISALLOWED_NETWORKS`**
@@ -102,6 +102,15 @@ TMDB filters run at **step 8**, after rating, votes, year, genre, and content ra
 - Use this when you want to exclude a few specific networks rather than maintaining a large allow-list.
 - Can be used independently of `TMDB_ALLOWED_NETWORKS`. Combining both works — a show must not be on the disallowed list AND must be on the allowed list.
 - Same naming rules: network names must match TMDB exactly. Shows with no network data pass through.
+- **Known limitation:** checks only the originating broadcast network, not the streaming distributor. A show like *Bodyguard* (BBC One on TMDB, Netflix in reality) slips through. Use `TMDB_DISALLOWED_PROVIDERS` below for the more reliable filter.
+
+**`TMDB_DISALLOWED_PROVIDERS`** *(shows only — recommended)*
+- Blocks shows currently streaming on the listed subscription providers in your configured region. Uses TMDB's Watch Providers API, which tracks the actual streaming distributor — so it catches shows the `networks` filter misses (e.g. *Bodyguard* via Netflix) and survives network rebrands.
+- Only the `flatrate` (subscription-included) bucket is checked. Rent/buy providers are ignored, so the filter never blocks content you'd buy separately.
+- Match is case-sensitive `startswith`, not exact — `Apple TV` catches `Apple TV Amazon Channel`, but `Max` does **not** catch `Cinemax`. Pick the most-specific prefix that catches all the bundle variants for a given service.
+- **Movies are unaffected** — theatrical releases often have higher-quality non-streaming versions available (UHD Blu-ray rips), and you probably want those even when the streaming version is on a service you subscribe to. The filter is deliberately TV-only.
+- Region is set via `TMDB_PROVIDER_REGION` (ISO 3166-1 country code, default `US`).
+- Examples: `Netflix, Apple TV, HBO Max, Max, Disney Plus, Hulu, Amazon Prime Video`.
 
 **`TMDB_ORIGINAL_LANGUAGE`**
 - Use this instead of (or alongside) `TRAKT_LANGUAGES` when you need to filter by actual production language. `TRAKT_LANGUAGES=en` filters at the API level but matches metadata language — a Korean drama with an English localisation can pass through. `TMDB_ORIGINAL_LANGUAGE=en` checks TMDB's `original_language` field, which reflects what language the show or film was actually produced in.
@@ -229,8 +238,10 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TMDB_MAX_EPISODES` | `0` | Skip shows with more than this many total episodes (0 = disabled, requires `TMDB_API_KEY`) |
 | `TMDB_ALLOWED_SHOW_STATUS` | | Only allow shows with these statuses (comma-separated, requires `TMDB_API_KEY`). Values: `Returning Series`, `Planned`, `In Production`, `Ended`, `Canceled`, `Pilot`. Empty = all statuses allowed. |
 | `TMDB_EXCLUDE_SHOW_TYPES` | | Skip shows of these TMDB types (comma-separated, requires `TMDB_API_KEY`). Values: `Scripted`, `Miniseries`, `Documentary`, `Reality`, `News`, `Talk Show`. Note: values with spaces (e.g. `Talk Show`) are safe in `.env` — the whole line is read as-is. |
-| `TMDB_ALLOWED_NETWORKS` | | Only allow shows from these networks (comma-separated, requires `TMDB_API_KEY`). Examples: `HBO`, `Netflix`, `AMC`, `FX`, `Apple TV+`, `Hulu`, `Disney+`, `Showtime`. |
-| `TMDB_DISALLOWED_NETWORKS` | | Skip shows from these networks (comma-separated, requires `TMDB_API_KEY`). Inverse of `TMDB_ALLOWED_NETWORKS`. Examples: `Netflix`, `Hulu`, `Disney+`. |
+| `TMDB_ALLOWED_NETWORKS` | | Only allow shows from these networks (comma-separated, requires `TMDB_API_KEY`). Examples: `HBO`, `Netflix`, `AMC`, `FX`, `Apple TV`, `Hulu`, `Disney+`, `Showtime`. |
+| `TMDB_DISALLOWED_NETWORKS` | | Skip shows from these networks (comma-separated, requires `TMDB_API_KEY`). Inverse of `TMDB_ALLOWED_NETWORKS`. Examples: `Netflix`, `Hulu`, `Disney+`. Note: only checks originating network — for streaming distributors use `TMDB_DISALLOWED_PROVIDERS`. |
+| `TMDB_DISALLOWED_PROVIDERS` | | Skip **shows only** that are currently streaming on these subscription providers in `TMDB_PROVIDER_REGION` (comma-separated, requires `TMDB_API_KEY`). Uses TMDB Watch Providers API — more reliable than `TMDB_DISALLOWED_NETWORKS` for catching streaming distributors and surviving network rebrands. Case-sensitive `startswith` match (so `Apple TV` catches `Apple TV Amazon Channel` but `Max` does not catch `Cinemax`). Movies are unaffected. Examples: `Netflix, Apple TV, HBO Max, Max`. |
+| `TMDB_PROVIDER_REGION` | `US` | ISO 3166-1 country code for the Watch Providers lookup (used by `TMDB_DISALLOWED_PROVIDERS`). |
 | `TMDB_MAX_SEASONS` | `0` | Skip shows with more than this many seasons (0 = disabled, requires `TMDB_API_KEY`). Complements `TMDB_MAX_EPISODES` — use one or both. |
 | `TMDB_ORIGINAL_LANGUAGE` | | Filter by original production language (comma-separated ISO 639-1 codes, requires `TMDB_API_KEY`). More accurate than `TRAKT_LANGUAGES` which uses metadata language. Applies to both shows and movies. Examples: `en`, `en,fr`, `ko,ja`. Empty = all languages allowed. |
 | `TRAKT_SEERR_RECHECK_DAYS` | `365` | Days before a `skipped_exists` record expires and the item is re-evaluated. Useful with auto-deletion tools (e.g. Jellysweep) — content deleted from your library will re-enter the discovery pipeline after this window and may be re-requested. `0` = permanent (never re-check). |

@@ -108,6 +108,12 @@ TMDB_ALLOWED_NETWORKS = parse_env_list("TMDB_ALLOWED_NETWORKS")
 TMDB_DISALLOWED_NETWORKS = parse_env_list("TMDB_DISALLOWED_NETWORKS")
 TMDB_MAX_SEASONS = get_int_env("TMDB_MAX_SEASONS", 0)  # 0 = disabled
 TMDB_ORIGINAL_LANGUAGE = parse_env_list("TMDB_ORIGINAL_LANGUAGE")  # e.g. ["en"] or ["en","ko"]
+# Disallowed streaming providers (shows only) — more robust than TMDB_DISALLOWED_NETWORKS.
+# Uses TMDB Watch Providers API: catches shows by their current streaming distributor
+# instead of their originating broadcast network. Fixes the "Bodyguard problem" (BBC
+# origination, Netflix distribution) and survives network-name rebrands.
+TMDB_DISALLOWED_PROVIDERS = parse_env_list("TMDB_DISALLOWED_PROVIDERS")
+TMDB_PROVIDER_REGION = os.getenv("TMDB_PROVIDER_REGION", "US").strip().upper()
 
 # Seerr recheck — days before a skipped_exists record expires so auto-deleted content
 # (e.g. Jellysweep purges) can be re-discovered and re-requested. 0 = permanent.
@@ -271,6 +277,7 @@ def seerr_post(endpoint, data):
 # TMDB HELPERS (optional — episode count, status, rating filters)
 # ============================================================
 _tmdb_cache = {}
+_tmdb_providers_cache = {}
 
 
 def tmdb_get(endpoint, params=None):
@@ -305,6 +312,27 @@ def fetch_tmdb_details(media_type, tmdb_id):
         return None
 
 
+def fetch_tmdb_watch_providers(media_type, tmdb_id):
+    """Fetch TMDB watch providers for the configured region, returning a list of
+    flatrate (subscription-included) provider names. Returns [] on failure or if
+    the region has no data. Cached per cycle alongside _tmdb_cache."""
+    cache_key = f"{media_type}:{tmdb_id}"
+    if cache_key in _tmdb_providers_cache:
+        return _tmdb_providers_cache[cache_key]
+
+    endpoint = f"/tv/{tmdb_id}/watch/providers" if media_type == "show" else f"/movie/{tmdb_id}/watch/providers"
+
+    try:
+        data = tmdb_get(endpoint)
+        region_data = (data or {}).get("results", {}).get(TMDB_PROVIDER_REGION, {})
+        providers = [p.get("provider_name", "") for p in region_data.get("flatrate", []) if p.get("provider_name")]
+        _tmdb_providers_cache[cache_key] = providers
+        return providers
+    except Exception as e:
+        log.debug(f"TMDB watch providers fetch failed for {media_type} {tmdb_id}: {e}")
+        _tmdb_providers_cache[cache_key] = []
+        return []
+
 
 def check_tmdb_filters(media_type, tmdb_id, title):
     """Check TMDB-based filters (episode count, show status, show type, networks, season count,
@@ -319,6 +347,7 @@ def check_tmdb_filters(media_type, tmdb_id, title):
         or TMDB_EXCLUDE_SHOW_TYPES
         or TMDB_ALLOWED_NETWORKS
         or TMDB_DISALLOWED_NETWORKS
+        or TMDB_DISALLOWED_PROVIDERS
         or TMDB_MAX_SEASONS > 0
         or TMDB_ORIGINAL_LANGUAGE
     )
@@ -364,6 +393,20 @@ def check_tmdb_filters(media_type, tmdb_id, title):
             matched = [n for n in networks if n in TMDB_DISALLOWED_NETWORKS]
             log.debug(f"Skipping '{title}' — disallowed network(s): {matched}")
             return False, "skipped_disallowed_network"
+
+    # Disallowed providers filter (shows only) — uses TMDB Watch Providers API.
+    # Catches streaming distributors that the network filter misses: shows like
+    # Bodyguard (BBC origination, Netflix distribution) and post-rebrand name
+    # variants (Apple TV+ → Apple TV, HBO Max → Max). Case-sensitive startswith
+    # match so "Apple TV" catches "Apple TV Amazon Channel" but "Max" does not
+    # catch "Cinemax". Only the flatrate (subscription) bucket is considered —
+    # rent/buy providers are ignored so movies you'd buy separately aren't blocked.
+    if media_type == "show" and TMDB_DISALLOWED_PROVIDERS:
+        providers = fetch_tmdb_watch_providers(media_type, tmdb_id)
+        matched = [p for p in providers if any(p.startswith(d) for d in TMDB_DISALLOWED_PROVIDERS)]
+        if matched:
+            log.debug(f"Skipping '{title}' — disallowed provider(s) in {TMDB_PROVIDER_REGION}: {matched}")
+            return False, "skipped_disallowed_provider"
 
     # Season count filter (shows only) — 0 seasons (unknown) passes through
     if media_type == "show" and TMDB_MAX_SEASONS > 0:
@@ -1147,6 +1190,7 @@ def discover_content(conn):
 
     # Clear per-cycle caches
     _tmdb_cache.clear()
+    _tmdb_providers_cache.clear()
     _token_cache.clear()
 
     # Fetch watch history to skip already-watched content
