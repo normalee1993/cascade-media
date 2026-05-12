@@ -137,8 +137,20 @@ DB_PATH = os.getenv("DB_PATH", "/data/media_automation.db")
 # Dry run
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# Alert webhook — fires only on token refresh failure requiring manual re-auth
+# Alerts — fire only on token refresh failure requiring manual re-auth.
+# Two independent channels: webhook (Discord/Slack/ntfy.sh) and email (SMTP).
+# Either, both, or neither may be configured. If none is set, failures are log-only.
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
+
+# Email alert config (Gmail SMTP example: host=smtp.gmail.com port=587 with App Password)
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
+ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")
+ALERT_EMAIL_SUBJECT_PREFIX = os.getenv("ALERT_EMAIL_SUBJECT_PREFIX", "[Cascade Media Alert]")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = get_int_env("SMTP_PORT", 587)
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 
 # Token cache — avoids redundant refresh checks within a single discovery cycle
 _token_cache = {}  # Keys: 'token', 'cached_at'
@@ -251,16 +263,49 @@ def trakt_post(endpoint, data=None, headers_override=None):
     return _api_request_with_retry(requests.post, f"{TRAKT_BASE_URL}{endpoint}", headers, json=data)
 
 
-def _send_alert_webhook(message):
-    """Fire optional webhook alert on token failure. Supports Discord (content) and Slack (text)."""
-    if not ALERT_WEBHOOK_URL:
+def _send_alert_email(subject, body):
+    """Send alert via SMTP. No-op if SMTP config is incomplete."""
+    if not (SMTP_HOST and ALERT_EMAIL_TO and ALERT_EMAIL_FROM):
         return
-    payload = {"content": message, "text": message}
+    import smtplib
+    from email.message import EmailMessage
+    full_subject = f"{ALERT_EMAIL_SUBJECT_PREFIX} {subject}".strip()
+    msg = EmailMessage()
+    msg["Subject"] = full_subject
+    msg["From"] = ALERT_EMAIL_FROM
+    msg["To"] = ALERT_EMAIL_TO
+    msg.set_content(body)
     try:
-        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
-        log.info("Alert webhook sent")
+        if SMTP_USE_TLS:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.starttls()
+                if SMTP_USER and SMTP_PASS:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                if SMTP_USER and SMTP_PASS:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        log.info(f"Alert email sent to {ALERT_EMAIL_TO}")
     except Exception as e:
-        log.warning(f"Alert webhook failed: {e}")
+        log.warning(f"Alert email failed: {e}")
+
+
+def _send_alert_webhook(message, subject="Token refresh failure"):
+    """Fire optional alerts on token failure.
+
+    Fans out to both webhook (Discord/Slack/ntfy.sh) and email channels — either
+    or both may be configured. Name kept for backward compatibility with callers.
+    """
+    if ALERT_WEBHOOK_URL:
+        payload = {"content": message, "text": message}
+        try:
+            requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
+            log.info("Alert webhook sent")
+        except Exception as e:
+            log.warning(f"Alert webhook failed: {e}")
+    _send_alert_email(subject, message)
 
 
 def seerr_get(endpoint):
@@ -849,20 +894,27 @@ def record_request(conn, media_type, tmdb_id, title, source):
 
 
 def fetch_watched_ids(conn):
-    """Fetch Trakt IDs of all watched shows and movies. Returns dict of sets keyed by media type."""
-    watched = {"show": set(), "movie": set()}
+    """Fetch Trakt IDs of all watched shows and movies.
+
+    Returns dict keyed by media type. A set means fetch succeeded (possibly empty).
+    None means fetch failed — callers must not request items of that type to avoid
+    re-requesting already-watched content.
+    """
+    watched = {"show": None, "movie": None}
     for media_type in ("show", "movie"):
         endpoint = f"/users/me/watched/{media_type}s"
         items = trakt_get(endpoint, auth_required=True, conn=conn)
-        if not items or not isinstance(items, list):
-            log.warning(f"Could not fetch watched {media_type}s from Trakt")
+        if not isinstance(items, list):
+            log.warning(f"Could not fetch watched {media_type}s from Trakt — skipping {media_type} requests to avoid re-requesting watched content")
             continue
+        ids: set[int] = set()
         for item in items:
             media = item.get(media_type, {})
             trakt_id = media.get("ids", {}).get("trakt")
             if trakt_id:
-                watched[media_type].add(trakt_id)
-        log.info(f"Loaded {len(watched[media_type])} watched {media_type}s from Trakt history")
+                ids.add(trakt_id)
+        watched[media_type] = ids
+        log.info(f"Loaded {len(ids)} watched {media_type}s from Trakt history")
     return watched
 
 
@@ -889,8 +941,12 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
     if is_already_discovered(conn, media_type, trakt_id):
         return request_count
 
-    # Skip if already watched on Trakt
-    if watched_ids and trakt_id in watched_ids.get(media_type, set()):
+    # Skip if already watched on Trakt, or if watched history fetch failed (None = unknown)
+    type_watched = watched_ids.get(media_type) if watched_ids is not None else None
+    if type_watched is None:
+        log.debug(f"Skipping '{title}' — watched history unavailable for {media_type}s")
+        return request_count
+    if trakt_id in type_watched:
         log.debug(f"Skipping '{title}' — already watched on Trakt")
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_watched", rating)
         return request_count
@@ -1296,6 +1352,28 @@ def cmd_discover(conn):
     discover_content(conn)
 
 
+def cmd_test_alert(conn):
+    """Send a test alert to all configured channels (webhook + email).
+
+    Confirms the notification path works without waiting for a real token failure.
+    """
+    configured = []
+    if ALERT_WEBHOOK_URL:
+        configured.append("webhook")
+    if SMTP_HOST and ALERT_EMAIL_TO and ALERT_EMAIL_FROM:
+        configured.append(f"email→{ALERT_EMAIL_TO}")
+    if not configured:
+        log.error("No alert channels configured. Set ALERT_WEBHOOK_URL and/or SMTP_* + ALERT_EMAIL_* in .env")
+        return False
+    log.info(f"Sending test alert to: {', '.join(configured)}")
+    _send_alert_webhook(
+        "This is a test alert from cascade-media. If you received this, your alert plumbing is working. "
+        "Real alerts will fire when the Trakt token refresh fails and re-authentication is required.",
+        subject="Test alert"
+    )
+    return True
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1316,9 +1394,12 @@ def main():
             cmd_reset(conn)
         elif command == "discover":
             cmd_discover(conn)
+        elif command == "test-alert":
+            success = cmd_test_alert(conn)
+            sys.exit(0 if success else 1)
         else:
             print(f"Unknown command: {command}")
-            print("Usage: python trakt_discovery.py [auth|reauth|discover|status|reset]")
+            print("Usage: python trakt_discovery.py [auth|reauth|discover|status|reset|test-alert]")
             sys.exit(1)
     finally:
         conn.close()
