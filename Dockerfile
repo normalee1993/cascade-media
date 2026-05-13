@@ -6,7 +6,7 @@ WORKDIR /app
 # log visibility in Docker (docker logs) and Unraid's container log viewer.
 ENV PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir requests tzdata
+RUN pip install --no-cache-dir requests==2.34.0 tzdata==2026.2
 
 COPY media_automation.py /app/
 COPY scheduler.py /app/

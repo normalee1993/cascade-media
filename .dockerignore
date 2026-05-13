@@ -1,0 +1,8 @@
+.git
+.env
+data/
+notes/
+CLAUDE.md
+STATUS.md
+reset-and-rebuild.sh
+verify-database.sh
