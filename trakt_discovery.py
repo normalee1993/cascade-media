@@ -595,7 +595,14 @@ def get_valid_token(conn):
 
     tokens = load_tokens(conn)
     if not tokens:
-        log.error("No Trakt tokens found. Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+        msg = (
+            "Trakt tokens MISSING from database — discovery is halted. Re-authenticate with:\n"
+            "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+        )
+        log.error(msg)
+        if not _token_cache.get("missing_alert_fired"):
+            _send_alert_webhook(msg)
+            _token_cache["missing_alert_fired"] = True
         return None
 
     expires_at = datetime.fromisoformat(tokens["expires_at"])

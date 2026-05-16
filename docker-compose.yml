@@ -11,7 +11,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
     labels:
       net.unraid.docker.icon: "https://cdn.jsdelivr.net/gh/normalee1993/cascade-media@main/logo.svg"
       net.unraid.docker.managed: "true"
