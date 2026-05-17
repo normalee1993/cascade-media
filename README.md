@@ -340,6 +340,47 @@ docker exec media-automation python /app/media_automation.py help
 docker compose pull && docker compose up -d
 ```
 
+Verify the new image is healthy:
+
+```bash
+docker compose ps                            # wait for STATUS to show (healthy) — 30-60s
+docker logs media-automation --tail 20       # confirm no startup errors
+```
+
+To pin to a specific version instead of `:latest`, edit the `image:` line in `docker-compose.yml`:
+
+```yaml
+image: ghcr.io/normalee1993/cascade-media:v1.2.0
+```
+
+Released versions and their changes are documented in [CHANGELOG.md](./CHANGELOG.md).
+
+## Container Operations
+
+The container is designed to run unattended. Several operator-facing behaviors were added in v1.2.0 — none require configuration, but knowing they exist helps when something goes wrong.
+
+### Health checks
+A built-in Docker `HEALTHCHECK` probes the webhook HTTP server on port 9191 every 30 seconds. If the scheduler or its webhook listener wedges, the container is marked unhealthy and surfaces in `docker compose ps` (and Unraid's container view).
+
+```bash
+docker compose ps                                                   # column "STATUS" shows (healthy)
+docker inspect media-automation --format '{{.State.Health.Status}}' # → "healthy"
+docker inspect media-automation --format '{{json .State.Health}}'   # full probe history
+```
+
+### Non-root user
+The container runs as **UID 99 GID 100** — Unraid's `nobody:users` convention. On Unraid this matches `/mnt/user/appdata/*` ownership so the bind mount works without any host-side `chown`. On other Linux hosts you may need to make the data directory writable by UID 99:
+
+```bash
+chown -R 99:100 /path/to/your/data/dir
+```
+
+### Log rotation
+Docker's `json-file` driver is configured in `docker-compose.yml` to cap logs at 10MB per file × 5 files (~50MB total). Rotation is automatic — `docker logs media-automation` always works regardless of how long the container has been running.
+
+### Graceful shutdown
+The scheduler handles SIGTERM and SIGINT cleanly. `docker stop media-automation` typically exits in ~1 second: the background loops wake from their sleeps, the webhook HTTP server is shut down, and the worker pool cancels pending tasks. `docker-compose.yml` sets `stop_grace_period: 30s` to give the scheduler room to drain in-flight subprocess work before Docker escalates to SIGKILL.
+
 ## How the Database Works
 
 The script uses a SQLite database at `/data/media_automation.db` (persisted via Docker volume) to track:
@@ -367,3 +408,13 @@ The database auto-cleans entries for series that no longer exist in Sonarr (e.g.
 - Verify the user's Jellyfin ID is in `JELLYFIN_USER_IDS`.
 - Check that the watch threshold has been met (default 75%).
 - Run `docker exec media-automation python /app/media_automation.py` to trigger a manual check.
+
+**Container reports unhealthy** *(v1.2.0+)*
+- Read the probe history: `docker inspect media-automation --format '{{json .State.Health}}'`. Repeated non-zero `ExitCode` entries mean the webhook server is not responding on port 9191.
+- Verify port 9191 isn't being claimed by another process on the host.
+- Check container logs: `docker logs media-automation --tail 50`. A wedged Trakt discovery loop or stalled subprocess will usually show up here.
+- Recover by restarting: `docker compose restart media-automation`.
+
+**Permission denied errors on /data after upgrading to v1.2.0+**
+- The container now runs as UID 99 GID 100 (non-root). On Unraid this matches `/mnt/user/appdata` ownership by default — no action needed.
+- On other Linux hosts where the data directory is owned by a different UID, fix with `chown -R 99:100 /path/to/your/data/dir` then `docker compose restart`.
