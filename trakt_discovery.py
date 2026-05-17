@@ -58,7 +58,6 @@ TRAKT_BASE_URL = "https://api.trakt.tv"
 
 # Discovery settings
 TRAKT_DISCOVERY_ENABLED = os.getenv("TRAKT_DISCOVERY_ENABLED", "false").lower() == "true"
-TRAKT_DISCOVERY_INTERVAL_HOURS = get_int_env("TRAKT_DISCOVERY_INTERVAL_HOURS", 6)
 TRAKT_DISCOVER_SHOWS = os.getenv("TRAKT_DISCOVER_SHOWS", "true").lower() == "true"
 TRAKT_DISCOVER_MOVIES = os.getenv("TRAKT_DISCOVER_MOVIES", "true").lower() == "true"
 TRAKT_LISTS = parse_env_list("TRAKT_LISTS", "recommended,watchlist,trending,popular,anticipated")

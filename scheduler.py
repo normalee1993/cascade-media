@@ -4,6 +4,7 @@
 import time
 import os
 import logging
+import signal
 import subprocess
 import sys
 import threading
@@ -11,7 +12,6 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
 import json
 
 logging.basicConfig(
@@ -70,9 +70,8 @@ webhook_lock = threading.Lock()
 playback_lock = threading.Lock()
 trakt_lock = threading.Lock()
 
-# Queue for webhook series that arrive while another webhook is processing
-pending_series = deque()
-pending_lock = threading.Lock()
+# Signalled from SIGTERM/SIGINT handlers; loops poll this instead of sleeping blindly
+shutdown_event = threading.Event()
 
 # Thread pool for webhook handling
 webhook_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="webhook")
@@ -209,15 +208,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_webhook_server():
-    """Start the webhook listener in a background thread."""
+def start_webhook_server(server):
+    """Run the webhook HTTPServer until its .shutdown() is called from another thread."""
     try:
-        server = HTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
         log.info(f"Webhook server listening on port {WEBHOOK_PORT}")
         server.serve_forever()
-    except OSError as e:
-        log.error(f"Failed to start webhook server on port {WEBHOOK_PORT}: {e}")
-        log.error("Continuing with polling-only mode")
     except Exception as e:
         log.error(f"Webhook server error: {e}", exc_info=True)
 
@@ -251,26 +246,35 @@ def run_trakt_script(args=None):
 def playback_check_loop():
     """Background loop that checks for active playback every N seconds."""
     log.info(f"Playback check loop started (interval: {PLAYBACK_CHECK_INTERVAL}s)")
-    while True:
+    while not shutdown_event.is_set():
         try:
             run_playback_script()
         except Exception as e:
             log.error(f"Error in playback check loop: {e}", exc_info=True)
-        time.sleep(PLAYBACK_CHECK_INTERVAL)
+        # wait() returns True if event was set during the wait — break promptly on SIGTERM
+        if shutdown_event.wait(PLAYBACK_CHECK_INTERVAL):
+            break
 
 
 def trakt_discovery_loop():
     """Background loop that runs Trakt discovery at a scheduled daily clock time (UTC)."""
     log.info(f"Trakt discovery loop started (daily at {TRAKT_DISCOVERY_TIME} {TRAKT_DISCOVERY_TZ_NAME})")
-    while True:
+    while not shutdown_event.is_set():
         next_run = next_discovery_run()
         wait = (next_run - datetime.now(TRAKT_DISCOVERY_TZ)).total_seconds()
         log.info(f"Trakt discovery next run: {next_run.strftime('%Y-%m-%d %H:%M')} {TRAKT_DISCOVERY_TZ_NAME} ({wait/3600:.1f}h from now)")
-        time.sleep(wait)
+        if shutdown_event.wait(wait):
+            break
         try:
             run_trakt_script(["discover"])
         except Exception as e:
             log.error(f"Error in Trakt discovery loop: {e}", exc_info=True)
+
+
+def _handle_shutdown_signal(signum, frame):
+    """SIGTERM/SIGINT handler — sets the shutdown_event so all loops can exit cleanly."""
+    log.info(f"Received signal {signum}, beginning graceful shutdown")
+    shutdown_event.set()
 
 
 def main():
@@ -286,9 +290,23 @@ def main():
         log.info(f"  Trakt discovery schedule: daily at {TRAKT_DISCOVERY_TIME} {TRAKT_DISCOVERY_TZ_NAME}")
         log.info(f"  Trakt next run: {next_run.strftime('%Y-%m-%d %H:%M')} {TRAKT_DISCOVERY_TZ_NAME} ({wait/3600:.1f}h from now)")
 
-    # Start webhook server in background
-    webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)
-    webhook_thread.start()
+    # Register graceful-shutdown handlers (must be done in main thread)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    # Build webhook HTTPServer up front so we hold a reference for .shutdown()
+    webhook_server = None
+    try:
+        webhook_server = HTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+    except OSError as e:
+        log.error(f"Failed to start webhook server on port {WEBHOOK_PORT}: {e}")
+        log.error("Continuing with polling-only mode")
+
+    if webhook_server is not None:
+        webhook_thread = threading.Thread(
+            target=start_webhook_server, args=(webhook_server,), daemon=True
+        )
+        webhook_thread.start()
 
     # Start playback check loop in background
     playback_thread = threading.Thread(target=playback_check_loop, daemon=True)
@@ -305,18 +323,25 @@ def main():
         run_poll_script(["catchup"])
 
     # Main polling loop (backup for webhooks)
-    while True:
+    while not shutdown_event.is_set():
         try:
             run_poll_script()
+            if shutdown_event.is_set():
+                break
             log.info(f"Sleeping for {INTERVAL_MINUTES} minutes...")
-            time.sleep(INTERVAL_MINUTES * 60)
-        except KeyboardInterrupt:
-            log.info("Shutting down...")
-            webhook_executor.shutdown(wait=False)
-            break
+            if shutdown_event.wait(INTERVAL_MINUTES * 60):
+                break
         except Exception as e:
             log.error(f"Error in main loop: {e}", exc_info=True)
-            time.sleep(60)
+            if shutdown_event.wait(60):
+                break
+
+    log.info("Shutting down...")
+    if webhook_server is not None:
+        webhook_server.shutdown()  # unblocks serve_forever() in the webhook thread
+    # cancel_futures discards pending webhook tasks; running ones complete or die on SIGKILL
+    webhook_executor.shutdown(wait=False, cancel_futures=True)
+    log.info("Shutdown complete")
 
 
 if __name__ == "__main__":

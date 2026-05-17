@@ -6,12 +6,27 @@ services:
     # build: .
     container_name: media-automation
     restart: unless-stopped
+    # Give SIGTERM handler time to drain in-flight webhook work before SIGKILL
+    stop_grace_period: 30s
     ports:
       - "${WEBHOOK_PORT:-9191}:${WEBHOOK_PORT:-9191}"
     env_file:
       - .env
     volumes:
       - ${DATA_DIR:-./data}:/data
+    # Cap docker logs at ~50MB total (10MB x 5 files); prevents disk fill
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Mirrors the Dockerfile HEALTHCHECK so compose-only deploys still get one
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:9191/', timeout=3).read(); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     labels:
       net.unraid.docker.icon: "https://cdn.jsdelivr.net/gh/normalee1993/cascade-media@main/logo.svg"
       net.unraid.docker.managed: "true"
