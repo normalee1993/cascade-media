@@ -367,3 +367,9 @@ The database auto-cleans entries for series that no longer exist in Sonarr (e.g.
 - Verify the user's Jellyfin ID is in `JELLYFIN_USER_IDS`.
 - Check that the watch threshold has been met (default 75%).
 - Run `docker exec media-automation python /app/media_automation.py` to trigger a manual check.
+
+**Got a "Trakt token refresh FAILED" or "Database readonly" alert email**
+- Check DB ownership: `stat /mnt/user/appdata/media-automation/data/media_automation.db` — should be `uid=99 gid=100 mode=664`. If the container can't write to the DB, `save_tokens()` fails *after* Trakt has already rotated the refresh_token, locking you out until manual re-auth.
+- Fix permissions from the host: `docker exec --user root media-automation chown 99:users /data/media_automation.db && docker exec --user root media-automation chmod 664 /data/media_automation.db`
+- Re-authenticate (interactive, ~1 min): `docker exec media-automation python -u /app/trakt_discovery.py auth`. Visit the URL it prints (`https://trakt.tv/activate`), enter the 8-character code, approve. The script saves the new tokens automatically.
+- Confirm with `docker exec -e DRY_RUN=true media-automation python -u /app/trakt_discovery.py discover` — should show "Loaded N watched shows / N watched movies" with no readonly errors.
