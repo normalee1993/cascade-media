@@ -307,6 +307,15 @@ def _send_alert_webhook(message, subject="Token refresh failure"):
     _send_alert_email(subject, message)
 
 
+def _send_alert_once(flag_name, message, subject="Token refresh failure"):
+    """Send alert with per-process dedup. Without this, both fetch_watched_ids(shows)
+    and fetch_watched_ids(movies) — plus any retries — independently fire the same
+    alert, producing the 2026-05-24 email storm (8 emails in 25 seconds)."""
+    if not _token_cache.get(flag_name):
+        _send_alert_webhook(message, subject=subject)
+        _token_cache[flag_name] = True
+
+
 def seerr_get(endpoint):
     """GET request to Seerr API."""
     return _api_request_with_retry(requests.get, f"{SEERR_URL}/api/v1{endpoint}", SEERR_HEADERS)
@@ -557,6 +566,36 @@ def load_tokens(conn):
     return None
 
 
+def check_db_writable(conn):
+    """Probe DB writability before doing work that depends on persistence.
+
+    The 2026-05-22 incident: bind-mounted DB was root-owned, container ran as
+    uid 99. SQLite opened read-only and the readonly state only surfaced inside
+    refresh_access_token's save_tokens call — by which point Trakt had already
+    rotated the refresh_token server-side, so the new token was lost. This probe
+    surfaces the readonly state loudly before any state can be consumed.
+    """
+    try:
+        # PRAGMA user_version = X writes the DB header even when X is unchanged,
+        # producing the same "attempt to write a readonly database" error path as
+        # the production failure. BEGIN IMMEDIATE alone is too soft — it doesn't
+        # trigger the readonly check until an actual write is attempted.
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.execute(f"PRAGMA user_version = {int(current)}")
+        return True
+    except sqlite3.OperationalError as e:
+        msg = (
+            f"Database is READONLY: {e}\n"
+            "Token refreshes and discovery state cannot be persisted.\n"
+            "Fix on the Unraid host:\n"
+            "  chown 99:users /mnt/user/appdata/media-automation/data/media_automation.db\n"
+            "  chmod 664 /mnt/user/appdata/media-automation/data/media_automation.db"
+        )
+        log.error(msg)
+        _send_alert_once("readonly_db_alert_fired", msg, subject="Database readonly")
+        return False
+
+
 def refresh_access_token(conn, refresh_token):
     """Refresh the Trakt access token."""
     log.info("Refreshing Trakt access token...")
@@ -571,17 +610,39 @@ def refresh_access_token(conn, refresh_token):
         resp = requests.post(f"{TRAKT_BASE_URL}/oauth/token", json=data, timeout=30)
         resp.raise_for_status()
         token_data = resp.json()
-        save_tokens(conn, token_data)
-        log.info("Token refreshed successfully")
-        return token_data["access_token"]
     except requests.exceptions.RequestException as e:
         log.error(f"Token refresh failed: {e}")
-        _send_alert_webhook(
+        _send_alert_once(
+            "refresh_failed_alert_fired",
             f"Trakt token refresh FAILED: {e}\n"
             "If the token is expired, re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
         )
         return None
+
+    # Trakt has now rotated the refresh_token server-side. If save_tokens fails
+    # (readonly DB, disk full, etc.) the new token is lost in memory AND the old
+    # one is invalid — we're locked out until manual re-auth. This is exactly
+    # the silent failure that bit production on 2026-05-22.
+    try:
+        save_tokens(conn, token_data)
+    except Exception as e:
+        log.error(
+            f"Got refreshed token from Trakt but COULD NOT SAVE locally: {e}. "
+            "The old refresh_token is now invalid server-side AND the new one is lost."
+        )
+        _send_alert_once(
+            "refresh_failed_alert_fired",
+            f"Trakt refresh persistence FAILED: {e}\n"
+            "Trakt rotated tokens server-side but local save failed (DB readonly?).\n"
+            "Re-authenticate with:\n"
+            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
+            subject="Token persistence failure",
+        )
+        return None
+
+    log.info("Token refreshed successfully")
+    return token_data["access_token"]
 
 
 def get_valid_token(conn):
@@ -615,8 +676,12 @@ def get_valid_token(conn):
     elif days_left <= 3:
         log.warning(f"Trakt token expires in {days_left} days — will auto-refresh soon")
 
-    # Refresh if within 2 days of expiry (tuned for Trakt's 7-day access token lifecycle)
-    if now >= expires_at - timedelta(days=2):
+    # Refresh if within 3 days of expiry. Trakt issues 7-day tokens; with the
+    # daily scheduler this gives 3 retry opportunities before expiry. Was 2 days
+    # pre-2026-05-24 incident — bumped to 3 after one cycle silently no-op'd
+    # (Trakt rotated the refresh_token but local save failed), leaving only one
+    # retry that hit a stale-refresh-token 400.
+    if now >= expires_at - timedelta(days=3):
         refreshed = refresh_access_token(conn, tokens["refresh_token"])
         if refreshed:
             _token_cache["token"] = refreshed
@@ -628,7 +693,7 @@ def get_valid_token(conn):
                 "  docker exec media-automation python -u /app/trakt_discovery.py auth"
             )
             log.error(msg)
-            _send_alert_webhook(msg)
+            _send_alert_once("expired_alert_fired", msg)
             return None
 
     token = tokens["access_token"]
@@ -1355,6 +1420,9 @@ def cmd_reset(conn):
 
 def cmd_discover(conn):
     """Run one discovery cycle."""
+    if not check_db_writable(conn):
+        log.error("Skipping discovery — database is readonly. See alert for fix.")
+        return
     discover_content(conn)
 
 
