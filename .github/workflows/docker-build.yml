@@ -70,3 +70,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  create-release:
+    # Auto-create a GitHub Release entry whenever a v* tag is pushed.
+    # Runs after build-and-push so a "Latest" release can never point at
+    # code that failed to ship as a container image. Notes are auto-generated
+    # from PRs merged since the previous tag — overwrite via the Releases UI
+    # if you want hand-written notes.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed so --generate-notes can diff against the previous tag
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
