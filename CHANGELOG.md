@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.2] - 2026-05-25
+
+### Fixed
+- **Cascade monitoring race against Sonarr's auto-search-on-add.** New TV series with many seasons could end up with full downloads of every season instead of the intended "Season 1 full + E01 previews" cascade. The original `apply_monitoring` looped one `PUT /api/v3/episode/{id}` per episode (~80ms each), which took ~4 seconds on a 56-episode series. Sonarr's auto-search command — fired by Seerr's series-add — enumerated monitored episode IDs at ~T+0.1s and pushed NZBs to SABnzbd before that loop could complete; once an NZB is in SABnzbd, neither monitor-flag changes nor Sonarr-queue cleanup can call it back. Reproduced 2026-05-25 with "Killer Cases" (S1 + S2E01 correct, S3–S7 every episode wrong).
+
+### Changed
+- **`apply_monitoring` now uses Sonarr's bulk `PUT /api/v3/episode/monitor` endpoint**, collapsing N per-episode PUTs into at most 2 bulk calls. The series-level `PUT /api/v3/series/{id}` (season-level `monitored` flags) now runs FIRST, before any episode work, so Sonarr stops auto-searching unmonitored seasons as quickly as possible. Race window shrinks from ~4s to ~250ms.
+
+### Added
+- First test coverage for `media_automation.py`: 7 unit tests covering `determine_target_season` (all-seasons / specific-seasons / Seerr "remaining" / files-exist / fallback) and `apply_monitoring` (bulk-endpoint usage, call ordering, no-op skip). Closes the test-coverage gap flagged in STATUS.md.
+
+### Notes
+- No environment-variable changes. No deployment-procedure changes beyond `docker compose pull && up -d`.
+- Existing series unaffected — fix only changes the API call shape during new-series setup. The 15s wait + 3-pass re-apply cleanup remains as defense in depth.
+
 ## [v1.2.1] - 2026-05-17
 
 ### Added
@@ -72,6 +87,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2
 [v1.2.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.1
 [v1.2.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.0
 [v1.1.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.1.0

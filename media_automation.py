@@ -482,8 +482,24 @@ def apply_monitoring(series_id, title, episodes, target_seasons, all_seasons):
 
     Args:
         target_seasons: set of season numbers to fully monitor
+
+    Issues three Sonarr API calls instead of one per episode:
+      1. PUT /series/{id}            — flips seasons[].monitored. Goes FIRST so
+         Sonarr stops auto-searching unmonitored seasons as quickly as possible.
+      2. PUT /episode/monitor (unmonitor list) — bulk-flip everything that
+         should be off (E02+ of preview seasons, specials).
+      3. PUT /episode/monitor (monitor list)   — bulk-flip preview E01s on.
+
+    The original implementation looped sonarr_put(f"/episode/{id}", ep) for
+    every episode, taking ~4 seconds for a typical series. Sonarr's
+    auto-search-on-add enumerates monitored episode IDs at T≈0.1s and pushes
+    NZBs to SABnzbd faster than that loop could complete, so unwanted seasons
+    were grabbed before we could unmonitor them (2026-05-25 Killer Cases).
+    The bulk endpoint reduces the race window to ~250ms.
     """
-    changes_made = 0
+    to_monitor = []
+    to_unmonitor = []
+    dry_run_changes = []
 
     for ep in episodes:
         season = ep.get("seasonNumber", 0)
@@ -492,39 +508,46 @@ def apply_monitoring(series_id, title, episodes, target_seasons, all_seasons):
         if season == 0:
             should_monitor = False
         elif season in target_seasons:
-            # Monitor ALL episodes in requested season(s)
             should_monitor = True
         elif episode_num == 1:
-            # Monitor ONLY Episode 1 of all other seasons (preview)
             should_monitor = True
         else:
             should_monitor = False
 
-        if ep.get("monitored") != should_monitor:
-            if DRY_RUN:
-                action = "MONITOR" if should_monitor else "UNMONITOR"
-                log.info(f"  [DRY RUN] Would {action}: {title} S{season:02d}E{episode_num:02d}")
-            else:
-                ep["monitored"] = should_monitor
-                sonarr_put(f"/episode/{ep['id']}", ep)
-            changes_made += 1
+        if ep.get("monitored") == should_monitor:
+            continue
 
-    # Update season-level monitoring in the series object.
-    # IMPORTANT: Only target seasons should be monitored at the series level.
-    # Setting non-target seasons to monitored=True causes Sonarr to
-    # re-monitor all their episodes, undoing our individual changes.
+        if should_monitor:
+            to_monitor.append(ep["id"])
+        else:
+            to_unmonitor.append(ep["id"])
+
+        if DRY_RUN:
+            action = "MONITOR" if should_monitor else "UNMONITOR"
+            dry_run_changes.append(
+                f"  [DRY RUN] Would {action}: {title} S{season:02d}E{episode_num:02d}"
+            )
+
+    changes_made = len(to_monitor) + len(to_unmonitor)
+
+    # Update season-level monitored flags. Non-target seasons MUST be False —
+    # setting them True causes Sonarr to re-monitor every episode within and
+    # undo our preview-only setup.
     series_detail = sonarr_get(f"/series/{series_id}")
     for season_info in series_detail.get("seasons", []):
         sn = season_info["seasonNumber"]
-        if sn in target_seasons:
-            season_info["monitored"] = True
-        else:
-            # Unmonitor at season level - individual E01 episodes
-            # remain monitored and will still be searched/downloaded
-            season_info["monitored"] = False
+        season_info["monitored"] = sn in target_seasons
 
-    if not DRY_RUN:
+    if DRY_RUN:
+        for line in dry_run_changes:
+            log.info(line)
+    else:
+        # Order matters: season-level gate first, then unmonitor, then monitor.
         sonarr_put(f"/series/{series_id}", series_detail)
+        if to_unmonitor:
+            sonarr_put("/episode/monitor", {"episodeIds": to_unmonitor, "monitored": False})
+        if to_monitor:
+            sonarr_put("/episode/monitor", {"episodeIds": to_monitor, "monitored": True})
 
     other_count = len(all_seasons - target_seasons)
     log.info(f"  Set monitoring for {title}: Seasons {sorted(target_seasons)} (full) + E01 of {other_count} other seasons ({changes_made} changes)")
