@@ -15,6 +15,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import media_automation
 import trakt_discovery
 
 
@@ -278,6 +279,238 @@ class DbWritabilityProbeTests(unittest.TestCase):
             self.assertIn("chown 99:users", msg)
         finally:
             conn.close()
+
+
+class CascadeTargetSeasonTests(unittest.TestCase):
+    """determine_target_season — which season(s) get the full download.
+
+    Encodes the priority documented in SYSTEM_DOCUMENTATION.md:
+      1. Seerr specific seasons → minimum requested + that set
+      2. Seerr "all seasons" → Season 1 only
+      3. Seerr "remaining seasons" (empty list) → lowest season without files
+      4. No Seerr, files exist → lowest season with files
+      5. No data → Season 1
+    """
+
+    @staticmethod
+    def _episodes(seasons_with_counts, seasons_with_files=()):
+        """Build a fake episodes list: {season_number: episode_count}."""
+        eps = []
+        ep_id = 1
+        for sn, count in seasons_with_counts.items():
+            for en in range(1, count + 1):
+                eps.append({
+                    "id": ep_id,
+                    "seasonNumber": sn,
+                    "episodeNumber": en,
+                    "monitored": True,
+                    "hasFile": sn in seasons_with_files,
+                })
+                ep_id += 1
+        return eps
+
+    def test_all_seasons_requested_targets_s1_only(self):
+        """Killer Cases case: Seerr returns full season list → target S1 only.
+        Without this, the cascade would request every season and the preview
+        logic would never run."""
+        series = {"title": "Killer Cases", "tvdbId": 12345}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12, 4: 12, 5: 8, 6: 6, 7: 8})
+        with patch.object(media_automation, "get_requested_seasons_from_seerr",
+                          return_value={1, 2, 3, 4, 5, 6, 7}):
+            target, target_seasons = media_automation.determine_target_season(series, episodes)
+        self.assertEqual(target, 1)
+        self.assertEqual(target_seasons, {1})
+
+    def test_specific_seasons_requested_targets_those(self):
+        """Partial-season request: only those seasons go full, everything else
+        gets the E01 preview treatment."""
+        series = {"title": "Show", "tvdbId": 100}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12, 4: 12})
+        with patch.object(media_automation, "get_requested_seasons_from_seerr",
+                          return_value={3, 4}):
+            target, target_seasons = media_automation.determine_target_season(series, episodes)
+        self.assertEqual(target, 3)
+        self.assertEqual(target_seasons, {3, 4})
+
+    def test_seerr_remaining_seasons_uses_lowest_unfilled(self):
+        """Empty seasons list from Seerr (the 'remaining seasons' UI option)
+        means 'whatever's missing'. Pick the lowest season without files."""
+        series = {"title": "Show", "tvdbId": 100}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12}, seasons_with_files={1})
+        with patch.object(media_automation, "get_requested_seasons_from_seerr",
+                          return_value=set()):
+            target, target_seasons = media_automation.determine_target_season(series, episodes)
+        self.assertEqual(target, 2)
+        self.assertEqual(target_seasons, {2})
+
+    def test_no_seerr_with_existing_files_uses_lowest_with_files(self):
+        """When Seerr doesn't know about the show (None) but files already exist,
+        treat the lowest-numbered season-with-files as the target."""
+        series = {"title": "Show", "tvdbId": 100}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12}, seasons_with_files={2, 3})
+        with patch.object(media_automation, "get_requested_seasons_from_seerr",
+                          return_value=None):
+            target, target_seasons = media_automation.determine_target_season(series, episodes)
+        self.assertEqual(target, 2)
+        self.assertEqual(target_seasons, {2, 3})
+
+    def test_no_seerr_no_files_defaults_to_s1(self):
+        series = {"title": "Show", "tvdbId": 100}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12})
+        with patch.object(media_automation, "get_requested_seasons_from_seerr",
+                          return_value=None):
+            target, target_seasons = media_automation.determine_target_season(series, episodes)
+        self.assertEqual(target, 1)
+        self.assertEqual(target_seasons, {1})
+
+
+class CascadeApplyMonitoringTests(unittest.TestCase):
+    """apply_monitoring — the per-episode monitor flips that gate Sonarr search.
+
+    2026-05-25 Killer Cases incident: the original implementation looped
+    sonarr_put(f"/episode/{id}", ep) for every episode, taking ~4 seconds.
+    Sonarr's auto-search-on-add enumerated episode IDs at T≈0.1s and had
+    pushed NZBs to SABnzbd before that loop could complete. The fix collapses
+    the loop to two bulk PUT /episode/monitor calls plus one PUT /series/{id}
+    season-level update — issued in that order, with the series PUT first so
+    season-level monitor=False stops Sonarr's auto-search before any episode
+    work begins."""
+
+    def _series_detail(self, all_seasons):
+        return {
+            "id": 1,
+            "title": "Show",
+            "seasons": [{"seasonNumber": sn, "monitored": True} for sn in sorted(all_seasons)],
+        }
+
+    @staticmethod
+    def _episodes(seasons_with_counts, currently_monitored=True):
+        """Episodes whose monitored flag matches Sonarr's default-on-add (all True)."""
+        eps = []
+        ep_id = 1
+        for sn, count in seasons_with_counts.items():
+            for en in range(1, count + 1):
+                eps.append({
+                    "id": ep_id,
+                    "seasonNumber": sn,
+                    "episodeNumber": en,
+                    "monitored": currently_monitored,
+                    "hasFile": False,
+                })
+                ep_id += 1
+        return eps
+
+    def test_uses_bulk_endpoint_not_per_episode_loop(self):
+        """For the 56-episode Killer Cases case, the new code should issue:
+          - 1× PUT /series/{id} (season-level flags)
+          - 1× PUT /episode/monitor (unmonitor list)
+          - 0–1× PUT /episode/monitor (monitor list — empty if previews already on)
+        and ZERO calls to /episode/{id}. The whole point of the fix."""
+        all_seasons = {1, 2, 3, 4, 5, 6, 7}
+        episodes = self._episodes({1: 10, 2: 10, 3: 12, 4: 12, 5: 8, 6: 6, 7: 8})
+        series_detail = self._series_detail(all_seasons)
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "sonarr_get", return_value=series_detail), \
+             patch.object(media_automation, "sonarr_put") as mock_put:
+            media_automation.apply_monitoring(
+                series_id=1, title="Killer Cases", episodes=episodes,
+                target_seasons={1}, all_seasons=all_seasons,
+            )
+
+        put_calls = mock_put.call_args_list
+        endpoints = [c.args[0] for c in put_calls]
+        # No per-episode PUTs
+        self.assertFalse(
+            any(ep.startswith("/episode/") and ep != "/episode/monitor" for ep in endpoints),
+            f"unexpected per-episode PUTs: {endpoints}",
+        )
+        # Series-level update happened exactly once
+        self.assertEqual(endpoints.count("/series/1"), 1)
+        # At least one bulk monitor call (the unmonitor list — 50 unwanted episodes)
+        self.assertGreaterEqual(endpoints.count("/episode/monitor"), 1)
+        self.assertLessEqual(endpoints.count("/episode/monitor"), 2)
+
+    def test_series_put_fires_before_episode_monitor(self):
+        """Ordering matters: season-level monitor=False on S2-7 must hit Sonarr
+        before any episode flip, so Sonarr's auto-search is gated as early as
+        possible."""
+        all_seasons = {1, 2, 3, 4}
+        episodes = self._episodes({1: 5, 2: 5, 3: 5, 4: 5})
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "sonarr_get",
+                          return_value=self._series_detail(all_seasons)), \
+             patch.object(media_automation, "sonarr_put") as mock_put:
+            media_automation.apply_monitoring(
+                series_id=1, title="Show", episodes=episodes,
+                target_seasons={1}, all_seasons=all_seasons,
+            )
+
+        endpoints = [c.args[0] for c in mock_put.call_args_list]
+        series_idx = endpoints.index("/series/1")
+        monitor_indices = [i for i, e in enumerate(endpoints) if e == "/episode/monitor"]
+        self.assertTrue(monitor_indices, "expected at least one /episode/monitor call")
+        self.assertLess(series_idx, min(monitor_indices),
+                        f"series PUT must precede all episode/monitor PUTs; got {endpoints}")
+
+    def test_bulk_unmonitor_payload_targets_correct_episodes(self):
+        """The unmonitor list must contain only the to-be-skipped episodes
+        (S2E02+, S3E02+, S4E02+) — never S1 episodes, never any E01 of a
+        non-target season."""
+        all_seasons = {1, 2, 3, 4}
+        # S1: 3 eps (all should stay monitored), S2-4: 4 eps each (E01 stays, E02-4 unmonitor)
+        episodes = self._episodes({1: 3, 2: 4, 3: 4, 4: 4})
+        episode_by_id = {ep["id"]: ep for ep in episodes}
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "sonarr_get",
+                          return_value=self._series_detail(all_seasons)), \
+             patch.object(media_automation, "sonarr_put") as mock_put:
+            media_automation.apply_monitoring(
+                series_id=1, title="Show", episodes=episodes,
+                target_seasons={1}, all_seasons=all_seasons,
+            )
+
+        monitor_calls = [c for c in mock_put.call_args_list if c.args[0] == "/episode/monitor"]
+        unmonitor_call = next((c for c in monitor_calls if c.args[1]["monitored"] is False), None)
+        self.assertIsNotNone(unmonitor_call, "expected an unmonitor bulk call")
+        unmonitored_ids = set(unmonitor_call.args[1]["episodeIds"])
+
+        for ep_id in unmonitored_ids:
+            ep = episode_by_id[ep_id]
+            self.assertNotEqual(ep["seasonNumber"], 1, f"S1 ep {ep_id} should never be unmonitored")
+            self.assertNotEqual(ep["episodeNumber"], 1,
+                                f"E01 of any season should never be unmonitored (ep {ep_id})")
+        # Expected count: S2-4 each have 3 unwanted episodes (E02, E03, E04) = 9 total
+        self.assertEqual(len(unmonitored_ids), 9)
+
+    def test_no_changes_means_no_bulk_calls(self):
+        """If episodes are already in their target state, only the series PUT
+        fires — no /episode/monitor calls. Avoids unnecessary API traffic in
+        the 15s/10s/20s/30s re-apply passes."""
+        all_seasons = {1, 2}
+        # Episode state already matches what we want: S1 all monitored, S2 only E01.
+        episodes = [
+            {"id": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": True, "hasFile": False},
+            {"id": 2, "seasonNumber": 1, "episodeNumber": 2, "monitored": True, "hasFile": False},
+            {"id": 3, "seasonNumber": 2, "episodeNumber": 1, "monitored": True, "hasFile": False},
+            {"id": 4, "seasonNumber": 2, "episodeNumber": 2, "monitored": False, "hasFile": False},
+        ]
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "sonarr_get",
+                          return_value=self._series_detail(all_seasons)), \
+             patch.object(media_automation, "sonarr_put") as mock_put:
+            changes = media_automation.apply_monitoring(
+                series_id=1, title="Show", episodes=episodes,
+                target_seasons={1}, all_seasons=all_seasons,
+            )
+
+        self.assertEqual(changes, 0)
+        endpoints = [c.args[0] for c in mock_put.call_args_list]
+        self.assertEqual(endpoints, ["/series/1"],
+                         f"expected only the series PUT; got {endpoints}")
 
 
 if __name__ == "__main__":
