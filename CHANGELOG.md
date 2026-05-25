@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.3] - 2026-05-25
+
+### Fixed
+- **Cascade over-grab race (real root cause).** v1.2.2 narrowed the API loop from ~4s to ~250ms believing Sonarr's auto-search-on-add re-checked episode `monitored` state during execution. It does not. `MissingEpisodeSearch` snapshots every monitored episode ID at command-queue time — which happens the same second the series is created with Sonarr's default-all-monitored — and serially grabs them regardless of subsequent monitor flips. v1.2.2 left correct episode-level state but Sonarr kept grabbing the captured IDs over the next ~90 seconds.
+  - Reproduced 2026-05-25 with *Euphoria (US)*: 175 ms monitor update, every grab still on the original snapshot. S2E02–E08 and S3E02–E07 all leaked.
+
+### Added
+- **`cancel_sonarr_auto_search(series_id, title)`** queries `/api/v3/command`, finds any `MissingEpisodeSearch` or `SeriesSearch` whose `body.seriesId` matches the just-added series and whose `status` is `queued` or `started`, and `DELETE`s each. Called as the FIRST API action in `process_new_series`, before any monitoring work. The webhook arrives the same second Sonarr queues the command and Sonarr's serial search loop runs for ~60–90 seconds before reaching non-target episodes, so this DELETE consistently lands in time.
+- 7 unit tests for the cancel function (correct series filter, only cancellable statuses, ignores unrelated command types, empty queue, DRY_RUN).
+
+### Notes
+- Cancelling a search command does NOT undo grabs that have already posted NZBs to SABnzbd. With the cancel running as the first API call (~200 ms into the webhook), no grabs have happened yet, so nothing is left to clean up.
+- The v1.2.2 bulk-PUT + reorder work is retained — it makes the subsequent episode-monitor flips and the 15s/10s/20s/30s re-apply passes much faster, and is correct independent of the auto-search race.
+
 ## [v1.2.2] - 2026-05-25
 
 ### Fixed
@@ -87,6 +101,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.2.3]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.3
 [v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2
 [v1.2.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.1
 [v1.2.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.0
