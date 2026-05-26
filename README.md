@@ -160,7 +160,17 @@ In Sonarr, go to **Settings > Connect > Add > Webhook**:
 - **URL**: `http://<your-server-ip>:9191`
 - **Events**: Check "On Series Add"
 
-### 2. Get API Keys
+### 2. Disable Jellyseerr/Overseerr "Enable Automatic Search" on Sonarr
+
+In Jellyseerr (or Overseerr), go to **Settings > Services > Sonarr**, edit each Sonarr server entry (pencil icon), and **uncheck "Enable Automatic Search"**. Save. Repeat for every Sonarr server you have configured (e.g. a 4K-only instance).
+
+**Why:** the cascade only works correctly if cascade-media controls when searches fire. With "Enable Automatic Search" on, Sonarr fires its own `MissingEpisodeSearch` the instant Seerr creates a multi-season series and grabs every episode of every season before cascade-media's monitoring can take effect. With it off, Seerr tells Sonarr to skip that search, and cascade-media's explicit `SeasonSearch` (target season) and `EpisodeSearch` (preview E01s) at ~T+17 seconds are the only searches that run.
+
+**Cost:** ~15 seconds of extra delay between Seerr "Request" and the first NZB grab. Movies (Radarr) are unaffected.
+
+Leave Sonarr's other Seerr settings (Default Server, Quality Profile, Root Folder, Enable Scan, etc.) unchanged.
+
+### 3. Get API Keys
 
 | Service | Where to find it |
 |---------|-----------------|
@@ -170,7 +180,7 @@ In Sonarr, go to **Settings > Connect > Add > Webhook**:
 | SABnzbd | Config > General > API Key |
 | Jellyfin User IDs | Dashboard > Users > click user > ID is in the URL |
 
-### 3. Configure Environment Variables
+### 4. Configure Environment Variables
 
 Copy the example configuration file and edit it with your API keys and server details:
 
@@ -181,7 +191,7 @@ nano .env  # or use your preferred editor
 
 Fill in your actual values for the API keys and service URLs.
 
-### 4. Build and Run
+### 5. Build and Run
 
 ```bash
 docker compose pull && docker compose up -d

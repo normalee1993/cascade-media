@@ -555,74 +555,24 @@ def apply_monitoring(series_id, title, episodes, target_seasons, all_seasons):
     return changes_made
 
 
-def cancel_sonarr_auto_search(series_id, title):
-    """Cancel Sonarr's auto-search-on-add commands for a series.
-
-    When Seerr creates a series in Sonarr with `addOptions.searchForMissingEpisodes`
-    (the default), Sonarr queues a `MissingEpisodeSearch` (or `SeriesSearch`)
-    command that snapshots every monitored episode ID and serially grabs them
-    over ~90+ seconds. The snapshot is taken at the moment the series is added
-    — when Sonarr's default makes every episode monitored — and the running
-    command does NOT re-check monitored state per episode. Flipping monitor
-    flags after the fact has no effect on what's already enumerated.
-
-    The webhook arrives within the same second the command is queued, giving
-    us a ~60-90 second window to DELETE the command before it reaches non-target
-    episodes. This is the actual fix for the cascade race; the v1.2.2 bulk-PUT
-    work only narrowed the window for related secondary effects.
-
-    Verified 2026-05-25 with Euphoria (US): MissingEpisodeSearch queued at
-    21:52:24, first non-target grab (S02E02) at 21:53:31 — 67 seconds of slack.
-    """
-    if DRY_RUN:
-        log.info(f"  [DRY RUN] Would query and cancel Sonarr auto-search commands for {title}")
-        return 0
-
-    SEARCH_COMMAND_NAMES = {"MissingEpisodeSearch", "SeriesSearch"}
-    CANCELLABLE_STATUSES = {"queued", "started"}
-
-    try:
-        commands = sonarr_get("/command") or []
-    except Exception as e:
-        log.warning(f"  Failed to query Sonarr commands (auto-search cancel skipped): {e}")
-        return 0
-
-    cancelled = 0
-    for cmd in commands:
-        if cmd.get("name") not in SEARCH_COMMAND_NAMES:
-            continue
-        if cmd.get("status") not in CANCELLABLE_STATUSES:
-            continue
-        body = cmd.get("body") or {}
-        if body.get("seriesId") != series_id:
-            continue
-        cmd_id = cmd.get("id")
-        try:
-            sonarr_delete(f"/command/{cmd_id}")
-            cancelled += 1
-            log.info(f"  Cancelled Sonarr {cmd['name']} (id={cmd_id}) for {title}")
-        except Exception as e:
-            log.warning(f"  Failed to cancel Sonarr command {cmd_id}: {e}")
-
-    if cancelled == 0:
-        log.info(f"  No Sonarr auto-search command found for {title} (already completed or never queued)")
-
-    return cancelled
-
-
 def process_new_series(conn, series):
-    """Set monitoring for a single new series based on Seerr request."""
+    """Set monitoring for a single new series based on Seerr request.
+
+    Requires Jellyseerr/Overseerr to have "Enable Automatic Search" UNCHECKED on
+    the Sonarr server config. Without that, Sonarr fires MissingEpisodeSearch
+    the same second the series is added, snapshots every monitored episode ID
+    (Sonarr's default = all monitored), and serially grabs them regardless of
+    any subsequent monitor flip. v1.2.2 narrowed the monitor-flip window;
+    v1.2.3 tried to DELETE the running search command and discovered Sonarr
+    returns 409 Conflict for any command in `started` status (transitions
+    queued→started in <1 s). v1.2.4 removed the cancel attempt and moved the
+    fix to the Jellyseerr config layer instead. See README "Required external
+    configuration" for the setting.
+    """
     series_id = series["id"]
     title = series["title"]
 
     log.info(f"Processing new series: {title} (ID: {series_id})")
-
-    # FIRST ACTION: cancel Sonarr's auto-search-on-add command. The webhook
-    # arrives the same second Sonarr queues that command, so we have a wide
-    # cancel window before it serially reaches non-target episodes. Without
-    # this, any subsequent monitor-flag changes are too late — the search
-    # already captured every episode ID when they were Sonarr's default-on.
-    cancel_sonarr_auto_search(series_id, title)
 
     episodes = sonarr_get(f"/episode?seriesId={series_id}")
     if not episodes:
