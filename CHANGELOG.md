@@ -4,7 +4,23 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.4] - 2026-05-25
+
+### Reverted
+- **`cancel_sonarr_auto_search` (added in v1.2.3) removed.** It hit `409 Conflict` on every real-world attempt: Sonarr refuses to `DELETE /api/v3/command/{id}` on commands in `started` status, and `MissingEpisodeSearch` transitions `queued → started` in under one second — faster than any webhook handler can react. The function's 7 unit tests are also removed. Verified the failure mode with Marvel's The Punisher (2 seasons) and Hacks (5 seasons): both leaked despite the cancel function firing, both produced `409 Conflict` warnings in the logs.
+
+### Changed (operational)
+- **REQUIRED setup:** Jellyseerr/Overseerr → Settings → Services → Sonarr → uncheck "Enable Automatic Search" on every Sonarr server. Without this, multi-season manual ("Request all seasons") submissions over-grab the entire show because Sonarr fires its own `MissingEpisodeSearch` immediately at series-add time. With it disabled, cascade-media's explicit `SeasonSearch` (target season) and `EpisodeSearch` (preview E01s) at T+17 s are the only searches that run.
+- README setup checklist and SYSTEM_DOCUMENTATION.md both gain a "Required external configuration" section documenting the Jellyseerr setting and explaining why it's necessary.
+
+### Notes
+- v1.2.2's bulk-PUT and season-level-first reorder work in `apply_monitoring` is retained — those changes are correct on their own merits (faster, lighter on Sonarr's API, fewer race-window seconds even if the race itself is now closed at a different layer).
+- Cost of the Jellyseerr config change: ~15 seconds extra delay between Seerr "Request" and first NZB grab (cascade-media's `SeasonSearch` fires after a 15 s settle wait). Movies via Radarr are unaffected.
+- Validated 2026-05-26 00:54 UTC with Rivals (2024) on Jellyseerr v3.2.0: zero `MissingEpisodeSearch` in Sonarr's command queue for the new series, 9 grabs total (8 S1 + 1 S2E01 preview), all `releaseSource: UserInvokedSearch`.
+
 ## [v1.2.3] - 2026-05-25
+
+> **Note (added 2026-05-25 evening, see v1.2.4):** The cancel-command approach this release introduced **does not work** in production. Sonarr returns `409 Conflict` for any `DELETE /api/v3/command/{id}` against a command in `started` status, and `MissingEpisodeSearch` transitions `queued → started` in under one second — faster than the webhook handler can react. The function is reverted in v1.2.4 and the actual fix moved to the Jellyseerr config layer.
 
 ### Fixed
 - **Cascade over-grab race (real root cause).** v1.2.2 narrowed the API loop from ~4s to ~250ms believing Sonarr's auto-search-on-add re-checked episode `monitored` state during execution. It does not. `MissingEpisodeSearch` snapshots every monitored episode ID at command-queue time — which happens the same second the series is created with Sonarr's default-all-monitored — and serially grabs them regardless of subsequent monitor flips. v1.2.2 left correct episode-level state but Sonarr kept grabbing the captured IDs over the next ~90 seconds.
@@ -103,6 +119,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.2.4]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.4
 [v1.2.3]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.3
 [v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2
 [v1.2.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.1

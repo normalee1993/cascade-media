@@ -8,17 +8,47 @@
 ## Table of Contents
 
 1. [System Overview](#system-overview)
-2. [Architecture](#architecture)
-3. [File Inventory](#file-inventory)
-4. [scheduler.py - The Orchestrator](#schedulerpy---the-orchestrator)
-5. [media_automation.py - Core TV Automation](#media_automationpy---core-tv-automation)
-6. [trakt_discovery.py - Content Discovery Engine](#trakt_discoverypy---content-discovery-engine)
-7. [Environment Variables - Complete Reference](#environment-variables---complete-reference)
-8. [Database Schema](#database-schema)
-9. [API Integrations](#api-integrations)
-10. [Execution Flows](#execution-flows)
-11. [Filter Pipeline](#filter-pipeline)
-12. [Docker and Deployment](#docker-and-deployment)
+2. [Required external configuration](#required-external-configuration)
+3. [Architecture](#architecture)
+4. [File Inventory](#file-inventory)
+5. [scheduler.py - The Orchestrator](#schedulerpy---the-orchestrator)
+6. [media_automation.py - Core TV Automation](#media_automationpy---core-tv-automation)
+7. [trakt_discovery.py - Content Discovery Engine](#trakt_discoverypy---content-discovery-engine)
+8. [Environment Variables - Complete Reference](#environment-variables---complete-reference)
+9. [Database Schema](#database-schema)
+10. [API Integrations](#api-integrations)
+11. [Execution Flows](#execution-flows)
+12. [Filter Pipeline](#filter-pipeline)
+13. [Docker and Deployment](#docker-and-deployment)
+
+---
+
+## Required external configuration
+
+cascade-media relies on two settings outside its own `.env` to work correctly. Both must be configured before the cascade behaves as designed.
+
+### 1. Sonarr webhook → cascade-media :9191
+
+Sonarr → Settings → Connect → add a new **Webhook**:
+
+- **Name:** cascade-media (anything)
+- **URL:** `http://<cascade-media-host>:9191`
+- **Method:** POST
+- **Triggers:** check **On Series Add** only (the only event cascade-media handles)
+
+Without this, new series in Sonarr never trigger cascade-media's `process_new_series` and the cascade never runs.
+
+### 2. Jellyseerr/Overseerr → "Enable Automatic Search" UNCHECKED
+
+Jellyseerr → Settings → Services → Sonarr → [your Sonarr server] → edit (pencil icon) → **uncheck "Enable Automatic Search"** → Save. Repeat for each Sonarr server (e.g. a 4K-only instance).
+
+**Why this is required.** When Seerr creates a series in Sonarr with `addOptions.searchForMissingEpisodes: true` (the Seerr default), Sonarr immediately queues a `MissingEpisodeSearch` command. That command snapshots every monitored episode ID at queue time — when Sonarr's default makes every episode `monitored=true` — and serially grabs them over ~60–120 seconds. The running command does NOT re-check episode `monitored` state per iteration, and Sonarr returns `409 Conflict` for any `DELETE /api/v3/command/{id}` against a command in `started` status (and commands transition `queued → started` in <1 second). No code-level fix in cascade-media can intercept this in time.
+
+With auto-search disabled at the Seerr layer, Seerr passes `searchForMissingEpisodes: false` when creating the series in Sonarr. No `MissingEpisodeSearch` fires. cascade-media's explicit `SeasonSearch` (target season) and `EpisodeSearch` (preview E01s) at ~T+17 s are the ONLY searches that run, with monitoring already correct before they trigger.
+
+**Cost:** ~15 second delay between Seerr "Request" and first NZB grab (vs. ~2 s with auto-search on). Movies (Radarr) are unaffected — different setting, different code path.
+
+**History.** Initially attempted in cascade-media code: v1.2.2 (bulk PUT + reorder, narrowed window to 250 ms) and v1.2.3 (`cancel_sonarr_auto_search`, DELETE the command on webhook arrival). Both insufficient — v1.2.2 left Sonarr's enumerated snapshot intact; v1.2.3 hit 409 Conflict because the command was already `started` by the time cascade-media's webhook handler completed its `GET /api/v3/command` + targeted `DELETE`. Moved to the Seerr config layer in v1.2.4 (2026-05-25). Validated end-to-end with Rivals (2024) on Jellyseerr v3.2.0.
 
 ---
 
@@ -204,7 +234,6 @@ TV show download lifecycle: initial setup, watch progress monitoring, playback d
 #### Task 1: Initial Monitoring for New Series
 1. Fetch all Sonarr series, filter by lookback window
 2. For each new series:
-   - **Cancel Sonarr's auto-search-on-add command** (FIRST API call — see "Cascade race condition" below)
    - Query Seerr for requested seasons
    - Determine target: Seerr request > existing files > Season 1
    - Monitor: ALL episodes for target, E01 only for others (bulk `PUT /episode/monitor`)
@@ -213,13 +242,7 @@ TV show download lifecycle: initial setup, watch progress monitoring, playback d
    - 3x cleanup passes (10s, 20s, 30s)
    - Record unlocked seasons
 
-##### Cascade race condition (v1.2.3 fix, 2026-05-25)
-
-When Seerr creates a series in Sonarr with `addOptions.searchForMissingEpisodes: true` (the Seerr default), Sonarr immediately queues a `MissingEpisodeSearch` command. That command **snapshots every monitored episode ID at queue time** — when Sonarr's default makes every episode `monitored=true` — and serially searches each ID over ~60–120 seconds. The running command does NOT re-check `monitored` state per episode, so flipping monitor flags afterwards has no effect on what's already enumerated.
-
-The SeriesAdd webhook arrives within the same second the search command is queued. `cancel_sonarr_auto_search` runs as the first API call in `process_new_series` to `DELETE /api/v3/command/{id}` for any `MissingEpisodeSearch` or `SeriesSearch` whose `body.seriesId` matches and whose status is `queued` or `started`. The DELETE lands ~200 ms after webhook arrival, far ahead of the first non-target indexer grab (~60 s for a 24-episode series).
-
-cascade-media's own discovery path is **not** affected by this race — `trakt_discovery.py` always requests `seasons=[1]`, so Sonarr's snapshot only contains S1 episodes (the target). The race only bites manual "request all seasons" submissions via Seerr's UI.
+> **REQUIRED setup for this flow to work correctly:** Jellyseerr/Overseerr must have "Enable Automatic Search" **unchecked** on each Sonarr server. Otherwise Sonarr fires its own `MissingEpisodeSearch` at series-add time and grabs every episode of every season before cascade-media's monitoring can take effect. See "Setup → Required external configuration" below for the why and the history. Validated 2026-05-25 with Rivals (2024) on Jellyseerr v3.2.0.
 
 #### `determine_target_season` Priority
 1. Seerr request with specific seasons -> minimum requested
@@ -525,7 +548,6 @@ title TEXT, source TEXT, requested_at TEXT
 ```
 Sonarr SeriesAdd -> POST :9191 -> webhook_executor
 -> media_automation.py webhook <id>
-  -> cancel_sonarr_auto_search (DELETE MissingEpisodeSearch/SeriesSearch)
   -> determine_target_season (Seerr > files > S01)
   -> apply_monitoring (bulk PUT: season-level first, then episode bulk)
   -> wait 15s + re-apply
@@ -533,6 +555,7 @@ Sonarr SeriesAdd -> POST :9191 -> webhook_executor
   -> 3x cleanup passes (10s, 20s, 30s) — re-apply + cleanup queue
   -> record unlocked seasons
 ```
+Assumes Jellyseerr's "Enable Automatic Search" is **off** on the Sonarr server — otherwise Sonarr's own `MissingEpisodeSearch` races this flow and over-grabs unrelated seasons.
 
 ### Flow 2: Watch Progress
 ```
