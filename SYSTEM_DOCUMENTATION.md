@@ -204,12 +204,22 @@ TV show download lifecycle: initial setup, watch progress monitoring, playback d
 #### Task 1: Initial Monitoring for New Series
 1. Fetch all Sonarr series, filter by lookback window
 2. For each new series:
+   - **Cancel Sonarr's auto-search-on-add command** (FIRST API call — see "Cascade race condition" below)
    - Query Seerr for requested seasons
    - Determine target: Seerr request > existing files > Season 1
-   - Monitor: ALL episodes for target, E01 only for others
+   - Monitor: ALL episodes for target, E01 only for others (bulk `PUT /episode/monitor`)
+   - Wait 15s + re-apply monitoring (Sonarr's background tasks may re-monitor)
    - Search: SeasonSearch for targets, EpisodeSearch for E01s
    - 3x cleanup passes (10s, 20s, 30s)
    - Record unlocked seasons
+
+##### Cascade race condition (v1.2.3 fix, 2026-05-25)
+
+When Seerr creates a series in Sonarr with `addOptions.searchForMissingEpisodes: true` (the Seerr default), Sonarr immediately queues a `MissingEpisodeSearch` command. That command **snapshots every monitored episode ID at queue time** — when Sonarr's default makes every episode `monitored=true` — and serially searches each ID over ~60–120 seconds. The running command does NOT re-check `monitored` state per episode, so flipping monitor flags afterwards has no effect on what's already enumerated.
+
+The SeriesAdd webhook arrives within the same second the search command is queued. `cancel_sonarr_auto_search` runs as the first API call in `process_new_series` to `DELETE /api/v3/command/{id}` for any `MissingEpisodeSearch` or `SeriesSearch` whose `body.seriesId` matches and whose status is `queued` or `started`. The DELETE lands ~200 ms after webhook arrival, far ahead of the first non-target indexer grab (~60 s for a 24-episode series).
+
+cascade-media's own discovery path is **not** affected by this race — `trakt_discovery.py` always requests `seasons=[1]`, so Sonarr's snapshot only contains S1 episodes (the target). The race only bites manual "request all seasons" submissions via Seerr's UI.
 
 #### `determine_target_season` Priority
 1. Seerr request with specific seasons -> minimum requested
@@ -515,9 +525,13 @@ title TEXT, source TEXT, requested_at TEXT
 ```
 Sonarr SeriesAdd -> POST :9191 -> webhook_executor
 -> media_automation.py webhook <id>
+  -> cancel_sonarr_auto_search (DELETE MissingEpisodeSearch/SeriesSearch)
   -> determine_target_season (Seerr > files > S01)
-  -> apply_monitoring (target=ALL, others=E01)
-  -> trigger searches -> 3x cleanup -> record unlocked
+  -> apply_monitoring (bulk PUT: season-level first, then episode bulk)
+  -> wait 15s + re-apply
+  -> trigger searches (SeasonSearch + EpisodeSearch for E01 previews)
+  -> 3x cleanup passes (10s, 20s, 30s) — re-apply + cleanup queue
+  -> record unlocked seasons
 ```
 
 ### Flow 2: Watch Progress

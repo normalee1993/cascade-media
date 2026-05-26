@@ -4,7 +4,23 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.3] - 2026-05-25
+
+### Fixed
+- **Cascade over-grab race (real root cause).** v1.2.2 narrowed the API loop from ~4s to ~250ms believing Sonarr's auto-search-on-add re-checked episode `monitored` state during execution. It does not. `MissingEpisodeSearch` snapshots every monitored episode ID at command-queue time — which happens the same second the series is created with Sonarr's default-all-monitored — and serially grabs them regardless of subsequent monitor flips. v1.2.2 left correct episode-level state but Sonarr kept grabbing the captured IDs over the next ~90 seconds.
+  - Reproduced 2026-05-25 with *Euphoria (US)*: 175 ms monitor update, every grab still on the original snapshot. S2E02–E08 and S3E02–E07 all leaked.
+
+### Added
+- **`cancel_sonarr_auto_search(series_id, title)`** queries `/api/v3/command`, finds any `MissingEpisodeSearch` or `SeriesSearch` whose `body.seriesId` matches the just-added series and whose `status` is `queued` or `started`, and `DELETE`s each. Called as the FIRST API action in `process_new_series`, before any monitoring work. The webhook arrives the same second Sonarr queues the command and Sonarr's serial search loop runs for ~60–90 seconds before reaching non-target episodes, so this DELETE consistently lands in time.
+- 7 unit tests for the cancel function (correct series filter, only cancellable statuses, ignores unrelated command types, empty queue, DRY_RUN).
+
+### Notes
+- Cancelling a search command does NOT undo grabs that have already posted NZBs to SABnzbd. With the cancel running as the first API call (~200 ms into the webhook), no grabs have happened yet, so nothing is left to clean up.
+- The v1.2.2 bulk-PUT + reorder work is retained — it makes the subsequent episode-monitor flips and the 15s/10s/20s/30s re-apply passes much faster, and is correct independent of the auto-search race.
+
 ## [v1.2.2] - 2026-05-25
+
+> **Note (added 2026-05-25 evening):** This release reduced the race window but did NOT close it — Sonarr's `MissingEpisodeSearch` snapshots episode IDs at queue time and does not re-check `monitored` state during execution. v1.2.3 ships the actual fix (cancel the search command outright). v1.2.2's bulk-PUT and reorder work is retained because it's correct on its own merits.
 
 ### Fixed
 - **Cascade monitoring race against Sonarr's auto-search-on-add.** New TV series with many seasons could end up with full downloads of every season instead of the intended "Season 1 full + E01 previews" cascade. The original `apply_monitoring` looped one `PUT /api/v3/episode/{id}` per episode (~80ms each), which took ~4 seconds on a 56-episode series. Sonarr's auto-search command — fired by Seerr's series-add — enumerated monitored episode IDs at ~T+0.1s and pushed NZBs to SABnzbd before that loop could complete; once an NZB is in SABnzbd, neither monitor-flag changes nor Sonarr-queue cleanup can call it back. Reproduced 2026-05-25 with "Killer Cases" (S1 + S2E01 correct, S3–S7 every episode wrong).
@@ -87,6 +103,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.2.3]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.3
 [v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2
 [v1.2.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.1
 [v1.2.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.0
