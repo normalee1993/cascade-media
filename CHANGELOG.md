@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [v1.2.2] - 2026-05-25
 
+> **Note (added 2026-05-25 evening):** This release reduced the race window but did NOT close it — Sonarr's `MissingEpisodeSearch` snapshots episode IDs at queue time and does not re-check `monitored` state during execution. v1.2.3 ships the actual fix (cancel the search command outright). v1.2.2's bulk-PUT and reorder work is retained because it's correct on its own merits.
+
 ### Fixed
 - **Cascade monitoring race against Sonarr's auto-search-on-add.** New TV series with many seasons could end up with full downloads of every season instead of the intended "Season 1 full + E01 previews" cascade. The original `apply_monitoring` looped one `PUT /api/v3/episode/{id}` per episode (~80ms each), which took ~4 seconds on a 56-episode series. Sonarr's auto-search command — fired by Seerr's series-add — enumerated monitored episode IDs at ~T+0.1s and pushed NZBs to SABnzbd before that loop could complete; once an NZB is in SABnzbd, neither monitor-flag changes nor Sonarr-queue cleanup can call it back. Reproduced 2026-05-25 with "Killer Cases" (S1 + S2E01 correct, S3–S7 every episode wrong).
 
