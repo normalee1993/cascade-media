@@ -500,6 +500,8 @@ title TEXT, source TEXT, requested_at TEXT
 | `/api/v3/queue` | GET | Download queue |
 | `/api/v3/queue/{id}` | DELETE | Cancel download |
 
+> **Known limitation — "matched by ID" import blocks.** When a completed download's release name doesn't parse to a library title (e.g. `Battlestar.Galactica.2005.S02E01` vs `Battlestar Galactica (2003)`), Sonarr/Radarr can only match it via grab-history ID and refuses to auto-import as a safety measure (`importBlocked`/`importPending`, *"Automatic import is not possible / Manual Import required"*). There is no config toggle to force import-by-ID; today these require a manual import in Activity → Queue. Auto-resolving them from the scheduler (`GET /api/v3/manualimport?downloadId=` → `POST /api/v3/command {"name":"ManualImport"}`) is tracked in `project_backlog.md`.
+
 ### Jellyfin
 | Endpoint | Usage |
 |----------|-------|

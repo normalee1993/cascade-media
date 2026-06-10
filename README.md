@@ -411,6 +411,13 @@ The database auto-cleans entries for series that no longer exist in Sonarr (e.g.
 - Look for "Script already running, skipping" in the logs. This only happens for polling runs, not webhooks. Webhooks have their own queue and will wait for each other.
 - The series will still be picked up on the next 15-minute poll cycle.
 
+**Download stuck in the Sonarr/Radarr queue ("Manual Import required")**
+- Symptom: a completed download sits in Activity → Queue as `importBlocked`/`importPending` with *"Found matching series/movie via grab history, but release was matched to series/movie by ID. Automatic import is not possible."*
+- Cause: the release name doesn't parse to the title in your library (e.g. `Battlestar.Galactica.2005.S02E01...` is stamped with the season's air-year and doesn't map to library entry `Battlestar Galactica (2003)`), so the *arr can only match by grab-history ID and refuses to auto-import as a safety measure. There is no "force import by ID" toggle in stable Sonarr/Radarr.
+- Manual fix: Activity → Queue → click the ⚠️ on the item → **Manual Import** → tick the file (series/episode are pre-filled) → **Import**.
+- Stop it re-grabbing the same offender: add a Release Profile *Must Not Contain* rule or a Custom Format that scores down the mis-named release group / wrong-year releases.
+- Automating this queue clean-up (scan for the "matched by ID" message → fire the manual import) is planned; not yet implemented.
+
 **Want to change what season is fully monitored**
 - Use the `reprocess` command after adjusting the request in Seerr.
 
