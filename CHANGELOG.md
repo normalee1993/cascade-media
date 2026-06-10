@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.3.0] - 2026-06-10
+
+### Added
+- **AI-powered discovery source (`"ai"`) for `trakt_discovery.py`.** Add `ai` to `TRAKT_LISTS` (typically first) and set `GEMINI_API_KEY` to have Google Gemini nominate ranked show/movie candidates each cycle. The model receives a taste profile built from your Trakt watch history (titles, years, genres, play counts), Trakt + TMDB trending lists, and — with `AI_WEB_SEARCH=true` — live Google Search grounding on what's currently popular across streaming platforms. Suggestions are resolved to real Trakt/TMDB IDs via a two-pass `/search` lookup (exact-year first, then year-relaxed) and then flow through the **existing filter pipeline unchanged** — rating, votes, year, genre, content-rating, TMDB, Seerr dedup, and watch-history checks all still apply; the AI only nominates candidates.
+- New env vars: `GEMINI_API_KEY`, `AI_MODEL` (default `gemini-flash-latest`, a floating alias that tracks Google's latest stable Flash model), `AI_WEB_SEARCH` (default true), `AI_HISTORY_ITEMS` (default 50).
+- New `trakt_search()` helper (public `/search/{type}` endpoint) and a lenient JSON parser for grounded model output (Gemini's JSON mode is incompatible with Google Search grounding, so the output contract is prompt-enforced).
+- 25 unit tests in `tests/test_ai_discovery.py` covering JSON parsing, title→ID resolution, per-cycle caching, request shape, and the failure path.
+
+### Notes
+- **Zero behavior change when unconfigured.** Without `ai` in `TRAKT_LISTS`, nothing differs from v1.2.4. With `ai` listed but no `GEMINI_API_KEY`, the source logs one warning and is skipped.
+- **Fail-loud fallback:** any Gemini failure (bad key, deprecated model, quota, network) logs an error, fires one alert per cycle through the existing webhook/email channels, and discovery falls through to the remaining `TRAKT_LISTS` sources.
+- One combined Gemini call per cycle covers both shows and movies (~1 call/day at default scheduling — well under typical free-tier limits; grounded calls have a separate daily free-tier cap).
+- A grounded Gemini call can take 10–30 s; raise `TRAKT_SCRIPT_TIMEOUT` if your cycle already runs near the 300 s default.
+- SemVer: MINOR bump — new backward-compatible functionality, no breaking changes.
+
 ## [v1.2.4] - 2026-05-25
 
 ### Reverted
@@ -119,6 +134,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.3.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.3.0
 [v1.2.4]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.4
 [v1.2.3]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.3
 [v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2
