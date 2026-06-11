@@ -348,6 +348,14 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 | `AI_MODEL` | gemini-flash-latest | Floating alias tracking Google's latest stable Flash model |
 | `AI_WEB_SEARCH` | true | Ground picks in live Google Search (grounded calls have a separate free-tier daily cap) |
 | `AI_HISTORY_ITEMS` | 50 | Watch-history items per type sent as taste profile |
+| `AI_SUGGESTIONS_MULTIPLIER` | 3 | Candidates per type = this × per-type request limit |
+| `AI_TIMEOUT_SECONDS` | 300 | Gemini call timeout; keep TRAKT_SCRIPT_TIMEOUT ≥ this + 120 |
+| `AI_MIN_RATING` | =TRAKT_MIN_RATING | AI-source-only rating floor |
+| `AI_MIN_VOTES` | =TRAKT_MIN_VOTES | AI-source-only vote floor |
+
+The prompt is fed `TMDB_DISALLOWED_NETWORKS` + `TMDB_DISALLOWED_PROVIDERS` so the
+model avoids titles exclusive to blocked platforms (the dominant cause of AI
+picks getting filtered to zero when a user blocks Netflix/Apple/Max/HBO).
 
 Flow: one Gemini call per cycle (covers shows + movies, cached in `_ai_cache`) →
 taste profile from `/users/me/watched/*` + Trakt/TMDB trending + DB exclusions →
