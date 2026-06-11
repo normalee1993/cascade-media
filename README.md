@@ -38,9 +38,10 @@ Automatically discovers trending, popular, and recommended content via the Trakt
 - **Anticipated** — Most anticipated upcoming releases
 - **Recommended** — Personalized recommendations based on your Trakt watch history
 - **Watchlist** — Your Trakt watchlist
+- **AI** *(optional)* — Gemini-powered picks matched to your watch history and current cross-platform streaming trends — see [AI-Powered Discovery](#ai-powered-discovery-gemini)
 
 ### Filtering pipeline
-Each discovered item goes through these filters before being requested:
+Each discovered item — including AI nominations — goes through these filters before being requested:
 1. **Already discovered** — Skips items seen in previous cycles
 2. **Already watched on Trakt** — Skips your complete watch history (import your Netflix/Amazon/etc. history to Trakt for best results)
 3. **Rating threshold** — Skips items below `TRAKT_MIN_RATING` (default: 7.0)
@@ -78,6 +79,37 @@ After cross-list items are requested, remaining download slots are filled from i
 | `TRAKT_CROSS_LIST_TARGETS` | `trending` | Lists providing the "popularity signal" |
 
 **How it works:** All configured lists are fetched upfront. Items found on both a source and target list are processed first (pass 1), using the source list for premium bypass eligibility. Remaining items are processed in the standard `TRAKT_LISTS` order (pass 2). Set `TRAKT_CROSS_LIST_PRIORITY=false` to revert to the original sequential behaviour.
+
+### AI-Powered Discovery (Gemini)
+
+An optional `ai` pseudo-source for `TRAKT_LISTS` that asks Google Gemini to nominate titles instead of reading a Trakt list. Place it first to give AI picks first claim on the request budget:
+
+```
+TRAKT_LISTS=ai,recommended,watchlist,trending,popular,anticipated
+```
+
+**How it works:** Once per discovery cycle, the script builds a taste profile from your recent Trakt watch history (titles, years, genres, play counts — `AI_HISTORY_ITEMS` per type), attaches Trakt trending + TMDB trending context and a do-not-suggest list (everything already watched, requested, or in your library), and makes **one** Gemini call covering both shows and movies. With `AI_WEB_SEARCH=true` the model also grounds its picks in live Google Search results — so "what's hot across Netflix/Max/Apple TV/Disney+ this week" is real data, not model memory. Each suggestion is then resolved to a real Trakt/TMDB ID via Trakt search (suggestions that don't resolve are dropped), and the survivors enter the **same filtering pipeline as every other source** — the AI only nominates; your rating, year, genre, network, and dedup filters still decide.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | *(empty)* | Free API key from https://aistudio.google.com/apikey — keep it only in your local `.env` |
+| `AI_MODEL` | `gemini-flash-latest` | Floating alias that tracks Google's latest stable Flash model — keeps working as Google ships new versions |
+| `AI_WEB_SEARCH` | `true` | Ground picks in live Google Search (requires a current-generation model; free tier caps grounded calls per day) |
+| `AI_HISTORY_ITEMS` | `50` | Recent watch-history items per type sent as the taste profile |
+
+**Setup:** get a key at https://aistudio.google.com/apikey, set `GEMINI_API_KEY` in `.env`, add `ai` to `TRAKT_LISTS`, recreate the container. Test with a dry run:
+
+```bash
+docker exec -e DRY_RUN=true -e TRAKT_LISTS=ai media-automation python -u /app/trakt_discovery.py discover
+```
+
+**Failure behaviour (fail-loud):** if the Gemini call fails for any reason — invalid key, deprecated/renamed model, quota exhausted, network error — the cycle logs an error, fires **one** alert through the configured webhook/email channels (same channels as the Trakt token alerts), and falls through to the remaining `TRAKT_LISTS` sources. A broken AI config can never break discovery, and you'll know about it without checking logs.
+
+**Notes:**
+- A grounded call takes 10–30 s. If your cycle already runs near `TRAKT_SCRIPT_TIMEOUT` (default 300 s), raise it.
+- `DRY_RUN` skips Seerr requests and DB writes but still makes the real Gemini call (that's the point of the test) — repeated dry runs count against the grounded-call free-tier daily cap.
+- Power-user options: add `ai` to `TRAKT_CROSS_LIST_SOURCES` to treat AI nominations as a "personal signal" in two-pass mode, or to `TRAKT_PREMIUM_BYPASS_LISTS` to let high-rated AI picks bypass year/status filters.
+- `TRAKT_LANGUAGES` is an API-level list parameter, so it doesn't constrain AI suggestions (the prompt hints at it, but it's soft). If language filtering matters to you, set `TMDB_ORIGINAL_LANGUAGE` — that's a hard filter that applies to AI picks too.
 
 ### TMDB Filters — Practical Notes
 
@@ -228,7 +260,7 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TRAKT_DISCOVERY_TZ` | `UTC` | IANA timezone for `TRAKT_DISCOVERY_TIME` (e.g. `America/Chicago`, `America/New_York`, `America/Los_Angeles`) |
 | `TRAKT_DISCOVER_SHOWS` | `true` | Discover TV shows |
 | `TRAKT_DISCOVER_MOVIES` | `true` | Discover movies |
-| `TRAKT_LISTS` | `recommended,watchlist,trending,popular,anticipated` | Which Trakt lists to check (processed in order; personalized lists first ensures they get priority) |
+| `TRAKT_LISTS` | `recommended,watchlist,trending,popular,anticipated` | Which Trakt lists to check (processed in order; personalized lists first ensures they get priority). Also accepts `ai` — see [AI-Powered Discovery](#ai-powered-discovery-gemini) |
 | `TRAKT_MIN_RATING` | `7.0` | Minimum Trakt rating to request |
 | `TRAKT_MIN_VOTES` | `100` | Minimum vote count to request |
 | `TRAKT_MAX_REQUESTS_PER_CYCLE` | `10` | Max new requests per discovery cycle (split evenly between shows/movies if per-type limits not set) |
@@ -259,6 +291,10 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `TRAKT_PREMIUM_BYPASS_MIN_RATING` | `8.0` | Minimum rating to qualify for bypass |
 | `TRAKT_PREMIUM_BYPASS_LISTS` | `recommended,watchlist` | List sources eligible for bypass |
 | `TRAKT_PREMIUM_BYPASS_FILTERS` | `year,status` | Which filters the bypass can override (`year`, `status`, or both) |
+| `GEMINI_API_KEY` | | Google Gemini API key — enables the `ai` discovery source (free key at https://aistudio.google.com/apikey) |
+| `AI_MODEL` | `gemini-flash-latest` | Gemini model for AI discovery. The default floating alias tracks Google's latest stable Flash model. |
+| `AI_WEB_SEARCH` | `true` | Ground AI picks in live Google Search results (current-generation models only; free tier caps grounded calls per day) |
+| `AI_HISTORY_ITEMS` | `50` | Recent watch-history items per type (shows/movies) sent to the AI as the taste profile |
 
 ### Finding Your Seerr User ID
 
