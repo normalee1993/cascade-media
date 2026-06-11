@@ -104,6 +104,23 @@ class AiJsonParsingTests(unittest.TestCase):
         self.assertIsNone(result[1]["year"])
 
 
+class BuildPromptTests(unittest.TestCase):
+    """build_ai_prompt — blocklist awareness so the model avoids filtered platforms."""
+
+    def test_blocked_platforms_become_hard_exclusion(self):
+        prompt = trakt_discovery.build_ai_prompt(
+            history=[], trakt_trending=[], tmdb_trending=[], exclusions=[],
+            n_shows=2, n_movies=2, blocked_platforms=["Netflix", "Apple TV"])
+        self.assertIn("CANNOT use these platforms: Netflix, Apple TV", prompt)
+        self.assertIn("do NOT".lower(), prompt.lower())
+
+    def test_no_blocklist_omits_exclusion(self):
+        prompt = trakt_discovery.build_ai_prompt(
+            history=[], trakt_trending=[], tmdb_trending=[], exclusions=[],
+            n_shows=2, n_movies=2, blocked_platforms=[])
+        self.assertNotIn("CANNOT use these platforms", prompt)
+
+
 class AiResolutionTests(unittest.TestCase):
     """resolve_ai_suggestion — two-pass Trakt search with strict-ish matching."""
 
@@ -157,19 +174,28 @@ class AiResolutionTests(unittest.TestCase):
                 {"title": "The Bear", "year": 2022, "media_type": "show"})
         self.assertIsNone(match)
 
-    def test_first_acceptable_result_wins(self):
+    def test_exact_match_preferred_over_prefix(self):
+        """The 'Sugar' → 'Sugar Apple Fairy Tale' bug: an exact normalized-title
+        match must win over a higher-ranked prefix near-match, even when the
+        prefix result appears first in Trakt's relevance order."""
         results = [
-            _search_result("show", "Fargo: Behind the Scenes", 2014, trakt_id=99),
-            _search_result("show", "Fargo", 2014, trakt_id=7),
+            _search_result("show", "Sugar Apple Fairy Tale", 2023, trakt_id=99),
+            _search_result("show", "Sugar", 2024, trakt_id=7),
         ]
         with patch.object(trakt_discovery, "trakt_get", return_value=results):
             match = trakt_discovery.resolve_ai_suggestion(
-                {"title": "Fargo", "year": 2014, "media_type": "show"})
-        # Both results pass the prefix rule; Trakt orders by relevance, so the
-        # first acceptable result wins by design (documents the tradeoff that a
-        # prefix-extension like "Fargo: Behind the Scenes" is accepted).
+                {"title": "Sugar", "year": 2024, "media_type": "show"})
         self.assertIsNotNone(match)
-        self.assertEqual(match["show"]["ids"]["trakt"], 99)
+        self.assertEqual(match["show"]["ids"]["trakt"], 7)
+
+    def test_prefix_fallback_when_no_exact(self):
+        """With no exact match, the first acceptable prefix near-match is used."""
+        results = [_search_result("show", "The Office (US)", 2005, trakt_id=5)]
+        with patch.object(trakt_discovery, "trakt_get", return_value=results):
+            match = trakt_discovery.resolve_ai_suggestion(
+                {"title": "The Office", "year": 2005, "media_type": "show"})
+        self.assertIsNotNone(match)
+        self.assertEqual(match["show"]["ids"]["trakt"], 5)
 
 
 class FetchAiListTests(unittest.TestCase):

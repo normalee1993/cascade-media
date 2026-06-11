@@ -96,8 +96,14 @@ TRAKT_LISTS=ai,recommended,watchlist,trending,popular,anticipated
 | `AI_MODEL` | `gemini-flash-latest` | Floating alias that tracks Google's latest stable Flash model — keeps working as Google ships new versions |
 | `AI_WEB_SEARCH` | `true` | Ground picks in live Google Search (requires a current-generation model; free tier caps grounded calls per day) |
 | `AI_HISTORY_ITEMS` | `50` | Recent watch-history items per type sent as the taste profile |
+| `AI_SUGGESTIONS_MULTIPLIER` | `3` | Candidates requested per type, as a multiple of your request limit (more = more likely to fill the budget) |
+| `AI_TIMEOUT_SECONDS` | `300` | Max wait for the Gemini response. Keep `TRAKT_SCRIPT_TIMEOUT` ≥ this + 120 (set `TRAKT_SCRIPT_TIMEOUT=600`) or the scheduler kills the run |
+| `AI_MIN_RATING` | = `TRAKT_MIN_RATING` | AI-source-only rating floor. Lower it (e.g. `6.5`) to let newer titles through without loosening other lists |
+| `AI_MIN_VOTES` | = `TRAKT_MIN_VOTES` | AI-source-only vote floor. Lower it (e.g. `20`) for brand-new titles that haven't accumulated Trakt votes yet |
 
-**Setup:** get a key at https://aistudio.google.com/apikey, set `GEMINI_API_KEY` in `.env`, add `ai` to `TRAKT_LISTS`, recreate the container. Test with a dry run:
+The AI is also told about your `TMDB_DISALLOWED_NETWORKS` / `TMDB_DISALLOWED_PROVIDERS` so it avoids suggesting titles exclusive to platforms you filter out — without that, picks on blocked platforms (a common cause of "0 requests") waste the budget.
+
+**Setup:** get a key at https://aistudio.google.com/apikey, set `GEMINI_API_KEY` in `.env`, add `ai` to `TRAKT_LISTS`, set `TRAKT_SCRIPT_TIMEOUT=600`, recreate the container. Test with a dry run:
 
 ```bash
 docker exec -e DRY_RUN=true -e TRAKT_LISTS=ai media-automation python -u /app/trakt_discovery.py discover
@@ -295,6 +301,10 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `AI_MODEL` | `gemini-flash-latest` | Gemini model for AI discovery. The default floating alias tracks Google's latest stable Flash model. |
 | `AI_WEB_SEARCH` | `true` | Ground AI picks in live Google Search results (current-generation models only; free tier caps grounded calls per day) |
 | `AI_HISTORY_ITEMS` | `50` | Recent watch-history items per type (shows/movies) sent to the AI as the taste profile |
+| `AI_SUGGESTIONS_MULTIPLIER` | `3` | Candidates the AI returns per type, as a multiple of the per-type request limit |
+| `AI_TIMEOUT_SECONDS` | `300` | Max wait for the Gemini call. Pair with `TRAKT_SCRIPT_TIMEOUT` ≥ this + 120 |
+| `AI_MIN_RATING` | `TRAKT_MIN_RATING` | AI-source-only rating floor (lower to admit newer titles) |
+| `AI_MIN_VOTES` | `TRAKT_MIN_VOTES` | AI-source-only vote floor (lower for brand-new titles with few Trakt votes) |
 
 ### Finding Your Seerr User ID
 

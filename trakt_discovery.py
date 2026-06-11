@@ -130,13 +130,22 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gemini-flash-latest")
 AI_WEB_SEARCH = os.getenv("AI_WEB_SEARCH", "true").lower() == "true"
 AI_HISTORY_ITEMS = get_int_env("AI_HISTORY_ITEMS", 50)
-# Grounded calls can take 10-30s; single attempt, no retry, to stay well under
-# the scheduler's TRAKT_SCRIPT_TIMEOUT. Deliberately NOT routed through
-# _api_request_with_retry (it hardcodes timeout=30).
-AI_TIMEOUT_SECONDS = 60
-# Ask for 2x the per-type request limit so resolution failures and filter
-# rejections don't leave the budget unfilled.
-AI_SUGGESTIONS_MULTIPLIER = 2
+# Single attempt, no retry. Grounded Flash calls take ~10-40s; a Pro model can
+# take longer, so this is configurable. IMPORTANT: keep TRAKT_SCRIPT_TIMEOUT
+# (scheduler, default 300s) comfortably above this value plus the rest of the
+# discovery cycle — recommend TRAKT_SCRIPT_TIMEOUT >= AI_TIMEOUT_SECONDS + 120.
+# Deliberately NOT routed through _api_request_with_retry (it hardcodes timeout=30).
+AI_TIMEOUT_SECONDS = get_int_env("AI_TIMEOUT_SECONDS", 300)
+# Ask for Nx the per-type request limit so resolution failures and filter
+# rejections don't leave the budget unfilled. Higher = more candidates = more
+# likely to fill the budget (at a few extra Trakt search calls each).
+AI_SUGGESTIONS_MULTIPLIER = get_int_env("AI_SUGGESTIONS_MULTIPLIER", 3)
+# AI-source-specific rating/vote floors. Default to the global thresholds, so
+# behavior is unchanged unless set. Relax these (e.g. AI_MIN_VOTES=20) to let
+# brand-new trending titles — which haven't accumulated Trakt votes yet — pass
+# for the "ai" source only, without loosening trending/popular/etc.
+AI_MIN_RATING = get_float_env("AI_MIN_RATING", TRAKT_MIN_RATING)
+AI_MIN_VOTES = get_int_env("AI_MIN_VOTES", TRAKT_MIN_VOTES)
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Seerr
@@ -843,8 +852,11 @@ def fetch_ai_exclusions(conn, limit=300):
     return [f"{title} ({media_type})" for title, media_type in rows]
 
 
-def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows, n_movies):
-    """Assemble the recommendation prompt. Pure function — unit-testable."""
+def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows, n_movies,
+                    blocked_platforms=None):
+    """Assemble the recommendation prompt. Pure function — unit-testable.
+    blocked_platforms: networks/providers the user filters out downstream — the
+    model is told to avoid titles exclusive to them so it doesn't waste slots."""
     lines = []
     asks = []
     if n_shows:
@@ -857,13 +869,22 @@ def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows,
     )
     lines.append(
         "Heavily weigh what is currently trending and talked about across major "
-        "streaming platforms (Netflix, Max, Apple TV, Disney+, Prime Video, Hulu, "
-        "Paramount+), balanced against the user's taste profile below."
+        "streaming platforms, balanced against the user's taste profile below."
     )
+    if blocked_platforms:
+        blocked = ", ".join(blocked_platforms)
+        lines.append(
+            f"CRITICAL: The user CANNOT use these platforms: {blocked}. Do NOT "
+            f"suggest any title that streams exclusively on them — those picks are "
+            f"useless and will be discarded. Favor titles available on other "
+            f"services (e.g. Disney+, Hulu, Prime Video, Paramount+, Peacock) or "
+            f"on broadcast/cable, even if a {blocked.split(',')[0].strip()} title "
+            f"is more prominent this week."
+        )
     if AI_WEB_SEARCH:
         lines.append(
-            "Use Google Search to check what is trending and newly released on "
-            "these platforms this week before deciding."
+            "Use Google Search to check what is trending and newly released "
+            "this week before deciding."
         )
 
     if history:
@@ -997,21 +1018,26 @@ def resolve_ai_suggestion(suggestion):
     norm_wanted = _normalize_title(title)
 
     def find_match(results, check_year):
-        for result in results:  # Trakt orders by relevance — first acceptable wins
+        # Two-tier: prefer an EXACT normalized-title match anywhere in the
+        # results before falling back to the looser startswith rule. Without
+        # this, "Sugar" matched "Sugar Apple Fairy Tale" because the latter
+        # ranked higher on Trakt and passed the prefix test first.
+        fallback = None
+        for result in results:  # Trakt orders by relevance
             media = result.get(media_type)
             if not media or not media.get("title"):
                 continue
-            norm_got = _normalize_title(media["title"])
-            # Bidirectional startswith catches "The Office (US)" vs "The Office",
-            # but stays strict enough to reject substring-anywhere false matches
-            if not (norm_got == norm_wanted
-                    or norm_got.startswith(norm_wanted)
-                    or norm_wanted.startswith(norm_got)):
-                continue
             if check_year and year and media.get("year") and abs(media["year"] - year) > 1:
                 continue
-            return result
-        return None
+            norm_got = _normalize_title(media["title"])
+            if norm_got == norm_wanted:
+                return result  # exact match wins outright
+            # Bidirectional startswith catches "The Office (US)" vs "The Office".
+            # Remember the first such near-match but keep scanning for an exact one.
+            if fallback is None and (norm_got.startswith(norm_wanted)
+                                     or norm_wanted.startswith(norm_got)):
+                fallback = result
+        return fallback
 
     years_param = f"{year - 1}-{year + 1}" if year else None
     match = find_match(trakt_search(media_type, title, years=years_param), check_year=True)
@@ -1076,9 +1102,14 @@ def fetch_ai_list(conn, media_type):
                 history.extend(fetch_watch_history_summary(conn, mt, AI_HISTORY_ITEMS))
                 trakt_trending.extend(_trending_titles_for_prompt(conn, mt))
 
+            # Tell the model which platforms the user filters out so it doesn't
+            # spend suggestions on titles that will be rejected downstream.
+            blocked_platforms = list(dict.fromkeys(
+                TMDB_DISALLOWED_NETWORKS + TMDB_DISALLOWED_PROVIDERS))
             prompt = build_ai_prompt(
                 history, trakt_trending, _tmdb_trending_titles(),
                 fetch_ai_exclusions(conn), n_shows, n_movies,
+                blocked_platforms=blocked_platforms,
             )
             log.info(f"Querying {AI_MODEL} for AI recommendations "
                      f"(web search: {AI_WEB_SEARCH}, asking for {n_shows} shows / {n_movies} movies)")
@@ -1355,15 +1386,21 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_watched", rating)
         return request_count
 
+    # Rating/vote floors. The "ai" source uses its own (by default identical)
+    # thresholds so brand-new trending titles, which lag on Trakt vote counts,
+    # can be let through for AI picks without loosening the other lists.
+    min_rating = AI_MIN_RATING if source == "ai" else TRAKT_MIN_RATING
+    min_votes = AI_MIN_VOTES if source == "ai" else TRAKT_MIN_VOTES
+
     # Skip if below rating threshold
-    if rating and rating < TRAKT_MIN_RATING:
-        log.debug(f"Skipping '{title}' — rating {rating:.1f} < {TRAKT_MIN_RATING}")
+    if rating and rating < min_rating:
+        log.debug(f"Skipping '{title}' — rating {rating:.1f} < {min_rating}")
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_rating", rating)
         return request_count
 
     # Skip if below vote threshold
-    if votes and votes < TRAKT_MIN_VOTES:
-        log.debug(f"Skipping '{title}' — {votes} votes < {TRAKT_MIN_VOTES}")
+    if votes and votes < min_votes:
+        log.debug(f"Skipping '{title}' — {votes} votes < {min_votes}")
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_votes", rating)
         return request_count
 
