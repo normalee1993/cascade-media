@@ -1,10 +1,10 @@
 services:
-  media-automation:
+  cascade-media:
     # Pull the pre-built image from GitHub Container Registry (recommended):
     image: ghcr.io/normalee1993/cascade-media:latest
     # To build from source instead (development), comment out image: above and uncomment:
     # build: .
-    container_name: media-automation
+    container_name: cascade-media
     restart: unless-stopped
     # Give SIGTERM handler time to drain in-flight webhook work before SIGKILL
     stop_grace_period: 30s
@@ -20,9 +20,16 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
-    # Mirrors the Dockerfile HEALTHCHECK so compose-only deploys still get one
+    # Conservative caps so a misbehaving poll/discovery run can't starve a
+    # shared Unraid host. This is a lightweight Python poller — 256MB is ample
+    # headroom; raise only if you see OOM kills in the logs.
+    mem_limit: 256m
+    cpus: 1.0
+    # Mirrors the Dockerfile HEALTHCHECK so compose-only deploys still get one.
+    # Probes the configured WEBHOOK_PORT (not a hardcoded 9191) so a custom port
+    # still gets a working health probe.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:9191/', timeout=3).read(); sys.exit(0)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${WEBHOOK_PORT:-9191}/', timeout=3).read(); sys.exit(0)"]
       interval: 30s
       timeout: 5s
       start_period: 30s

@@ -619,7 +619,7 @@ def refresh_access_token(conn, refresh_token):
             "refresh_failed_alert_fired",
             f"Trakt token refresh FAILED: {e}\n"
             "If the token is expired, re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth",
         )
         return None
 
@@ -639,7 +639,7 @@ def refresh_access_token(conn, refresh_token):
             f"Trakt refresh persistence FAILED: {e}\n"
             "Trakt rotated tokens server-side but local save failed (DB readonly?).\n"
             "Re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth",
             subject="Token persistence failure",
         )
         return None
@@ -660,7 +660,7 @@ def get_valid_token(conn):
     if not tokens:
         msg = (
             "Trakt tokens MISSING from database — discovery is halted. Re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth"
         )
         log.error(msg)
         if not _token_cache.get("missing_alert_fired"):
@@ -693,7 +693,7 @@ def get_valid_token(conn):
         if now >= expires_at:
             msg = (
                 "Trakt token EXPIRED and refresh FAILED. Re-authenticate with:\n"
-                "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+                "  docker exec cascade-media python -u /app/trakt_discovery.py auth"
             )
             log.error(msg)
             _send_alert_once("expired_alert_fired", msg)
