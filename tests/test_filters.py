@@ -757,6 +757,236 @@ class SecretLogRedactionTests(unittest.TestCase):
         # The failure is still reported, just without the secret.
         self.assertIn("Alert webhook failed", joined)
         self.assertIn("ConnectionError", joined)
+class AtomicClaimTests(unittest.TestCase):
+    """Item 2 (2026-06-13): atomic + durable processed_series claim.
+
+    Root causes fixed:
+      P1-2 durability — the old code committed 'processed' at the START of
+        process_new_series, before apply_monitoring/searches ran. A transient
+        Sonarr error afterwards left the series permanently flagged processed
+        with its monitoring never applied, so Sonarr kept every season monitored
+        and grabbed the whole library, never retried.
+      P1-3 cross-process race — the poll subprocess and a SeriesAdd webhook
+        subprocess (separate OS processes, no shared lock) could process the same
+        newly-added series concurrently → duplicate monitor flips, duplicate
+        SeasonSearch, duplicate SABnzbd grabs.
+
+    These use a REAL temp SQLite file through init_db() so the schema/migration
+    and the INSERT ... ON CONFLICT claim are exercised exactly as in production
+    (WAL, separate connections). Sonarr/Seerr HTTP is mocked.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "media_automation.db")
+        self._db_patch = patch.object(media_automation, "DB_PATH", self._db_path)
+        self._db_patch.start()
+
+    def tearDown(self):
+        self._db_patch.stop()
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _new_conn(self):
+        """A fresh connection via init_db — mimics a separate subprocess."""
+        return media_automation.init_db()
+
+    def _row(self, conn, sonarr_id):
+        c = conn.cursor()
+        conn.commit()
+        c.execute("SELECT status, processed_at FROM processed_series WHERE sonarr_id = ?", (sonarr_id,))
+        return c.fetchone()
+
+    # ---- schema / migration safety ---------------------------------------
+
+    def test_fresh_install_has_status_column(self):
+        """A brand-new DB created by init_db has the status column."""
+        conn = self._new_conn()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(processed_series)")}
+            self.assertIn("status", cols)
+        finally:
+            conn.close()
+
+    def test_migration_on_populated_legacy_db_backfills_done(self):
+        """An EXISTING DB built with the OLD schema (no status column) and
+        populated rows must migrate cleanly: the column is added and legacy rows
+        — which represent already-finished series — are treated as 'done'.
+        Re-running init_db must be idempotent (no 'duplicate column' error)."""
+        # Build a legacy DB by hand (old schema, no status column).
+        legacy = sqlite3.connect(self._db_path)
+        legacy.execute("""
+            CREATE TABLE processed_series (
+                sonarr_id INTEGER PRIMARY KEY,
+                title TEXT,
+                processed_at TEXT
+            )
+        """)
+        legacy.execute(
+            "INSERT INTO processed_series (sonarr_id, title, processed_at) VALUES (?, ?, ?)",
+            (42, "Legacy Show", "2026-01-01T00:00:00+00:00"),
+        )
+        legacy.commit()
+        legacy.close()
+
+        # First init_db migrates; second proves idempotency.
+        conn = media_automation.init_db()
+        conn.close()
+        conn = media_automation.init_db()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(processed_series)")}
+            self.assertIn("status", cols)
+            status = self._row(conn, 42)[0]
+            self.assertEqual(status, "done", "legacy rows must backfill to 'done'")
+            # A legacy 'done' row is reported processed and is NOT reclaimable.
+            self.assertTrue(media_automation.is_series_processed(conn, 42))
+            self.assertFalse(media_automation.claim_series_for_processing(conn, 42, "Legacy Show"))
+        finally:
+            conn.close()
+
+    # ---- atomic claim semantics ------------------------------------------
+
+    def test_first_claim_wins_second_concurrent_claim_loses(self):
+        """The claim is atomic: the first claimer wins (row created, 'in_progress')
+        and a SECOND claim attempt for the same id while still 'in_progress'
+        (non-stale) loses — it must NOT redo setup. Models poll vs webhook."""
+        conn_a = self._new_conn()
+        conn_b = self._new_conn()
+        try:
+            won_a = media_automation.claim_series_for_processing(conn_a, 7, "Race Show")
+            won_b = media_automation.claim_series_for_processing(conn_b, 7, "Race Show")
+            self.assertTrue(won_a, "first claimer must win")
+            self.assertFalse(won_b, "second concurrent claimer must lose (no duplicate setup)")
+            self.assertEqual(self._row(conn_a, 7)[0], "in_progress")
+        finally:
+            conn_a.close()
+            conn_b.close()
+
+    def test_done_series_is_not_reclaimable(self):
+        """Once status='done', a later claim attempt returns False (skip)."""
+        conn = self._new_conn()
+        try:
+            self.assertTrue(media_automation.claim_series_for_processing(conn, 9, "Done Show"))
+            media_automation.mark_series_done(conn, 9, "Done Show")
+            self.assertTrue(media_automation.is_series_processed(conn, 9))
+            self.assertFalse(media_automation.claim_series_for_processing(conn, 9, "Done Show"))
+        finally:
+            conn.close()
+
+    def test_stale_in_progress_is_reclaimable(self):
+        """An 'in_progress' claim older than STALE_CLAIM_MINUTES self-heals: a
+        later run can re-claim it (crash-mid-setup recovery)."""
+        conn = self._new_conn()
+        try:
+            # Forge a stale claim directly.
+            stale_ts = (media_automation.datetime.now(media_automation.timezone.utc)
+                        - media_automation.timedelta(minutes=media_automation.STALE_CLAIM_MINUTES + 5)).isoformat()
+            with conn:
+                conn.execute(
+                    "INSERT INTO processed_series (sonarr_id, title, status, processed_at) VALUES (?, ?, 'in_progress', ?)",
+                    (11, "Crashed Show", stale_ts),
+                )
+            # is_series_processed must NOT report a stale in_progress as processed.
+            self.assertFalse(media_automation.is_series_processed(conn, 11))
+            self.assertTrue(
+                media_automation.claim_series_for_processing(conn, 11, "Crashed Show"),
+                "stale in_progress claim must be reclaimable",
+            )
+            # Reclaim refreshes the timestamp so a fresh (non-stale) claim is held.
+            row = self._row(conn, 11)
+            self.assertEqual(row[0], "in_progress")
+            self.assertFalse(media_automation._claim_is_stale(row[1], media_automation.datetime.now(media_automation.timezone.utc)))
+        finally:
+            conn.close()
+
+    def test_fresh_in_progress_not_reclaimable(self):
+        """A non-stale 'in_progress' claim is NOT reclaimable (guards the race)."""
+        conn = self._new_conn()
+        try:
+            self.assertTrue(media_automation.claim_series_for_processing(conn, 13, "Busy Show"))
+            self.assertFalse(media_automation.claim_series_for_processing(conn, 13, "Busy Show"))
+        finally:
+            conn.close()
+
+    # ---- durability: failed setup leaves series re-claimable -------------
+
+    def _series(self, sonarr_id=21, title="Durability Show"):
+        return {"id": sonarr_id, "title": title, "tvdbId": 555}
+
+    def _episodes(self):
+        return [
+            {"id": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": True, "hasFile": False},
+            {"id": 2, "seasonNumber": 1, "episodeNumber": 2, "monitored": True, "hasFile": False},
+            {"id": 3, "seasonNumber": 2, "episodeNumber": 1, "monitored": True, "hasFile": False},
+        ]
+
+    def test_failed_apply_monitoring_leaves_series_reclaimable_and_retries(self):
+        """P1-2 durability fix: if apply_monitoring raises, the claim is released
+        (not flagged 'done'), so the series is re-claimable and the NEXT run
+        retries it instead of locking it half-configured forever."""
+        conn = self._new_conn()
+        try:
+            series = self._series()
+            with patch.object(media_automation, "DRY_RUN", True), \
+                 patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
+                 patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
+                 patch.object(media_automation, "apply_monitoring",
+                              side_effect=RuntimeError("transient Sonarr 500")):
+                with self.assertRaises(RuntimeError):
+                    media_automation.process_new_series(conn, series)
+
+            # Must NOT be marked done; row should be gone (released) → reclaimable.
+            self.assertFalse(media_automation.is_series_processed(conn, series["id"]))
+            self.assertIsNone(self._row(conn, series["id"]),
+                              "failed setup must release the claim row entirely")
+
+            # Next run succeeds → ends 'done', and apply_monitoring/searches ran.
+            with patch.object(media_automation, "DRY_RUN", True), \
+                 patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
+                 patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
+                 patch.object(media_automation, "apply_monitoring") as good_apply:
+                media_automation.process_new_series(conn, series)
+                good_apply.assert_called()
+            self.assertTrue(media_automation.is_series_processed(conn, series["id"]))
+            self.assertEqual(self._row(conn, series["id"])[0], "done")
+        finally:
+            conn.close()
+
+    def test_successful_process_new_series_flips_to_done_only_at_end(self):
+        """Happy path: status is 'done' only AFTER setup completes."""
+        conn = self._new_conn()
+        try:
+            series = self._series(sonarr_id=23, title="Happy Show")
+            with patch.object(media_automation, "DRY_RUN", True), \
+                 patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
+                 patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
+                 patch.object(media_automation, "apply_monitoring", return_value=0):
+                media_automation.process_new_series(conn, series)
+            self.assertEqual(self._row(conn, 23)[0], "done")
+            # Target season was unlocked as part of successful setup.
+            self.assertTrue(media_automation.is_season_unlocked(conn, 23, 1))
+        finally:
+            conn.close()
+
+    def test_second_process_skips_when_already_in_progress(self):
+        """If a series is already claimed 'in_progress' (non-stale), a second
+        process_new_series call short-circuits before touching apply_monitoring,
+        so no duplicate monitor flips / searches occur (P1-3)."""
+        conn = self._new_conn()
+        try:
+            series = self._series(sonarr_id=25, title="Inflight Show")
+            # Pre-existing fresh in_progress claim by a "different process".
+            media_automation.claim_series_for_processing(conn, 25, "Inflight Show")
+            with patch.object(media_automation, "DRY_RUN", True), \
+                 patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
+                 patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
+                 patch.object(media_automation, "apply_monitoring") as apply_mock:
+                media_automation.process_new_series(conn, series)
+                apply_mock.assert_not_called()
+            # Still in_progress (owned by the original claimant), not flipped done.
+            self.assertEqual(self._row(conn, 25)[0], "in_progress")
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
