@@ -4,10 +4,15 @@ Each test covers a specific incident class — comments name the dates so future
 maintainers can trace which real-world failure each guard exists to prevent.
 """
 
+import io
 import os
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +21,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import media_automation
+import scheduler
 import trakt_discovery
 
 
@@ -511,6 +517,194 @@ class CascadeApplyMonitoringTests(unittest.TestCase):
         endpoints = [c.args[0] for c in mock_put.call_args_list]
         self.assertEqual(endpoints, ["/series/1"],
                          f"expected only the series PUT; got {endpoints}")
+
+
+class SchedulerWebhookHardeningTests(unittest.TestCase):
+    """Item 4 / P2-6: webhook server robustness.
+
+    A malformed or oversized Content-Length must return a clean 400 / 413 instead
+    of an unhandled traceback (which previously crashed do_POST before the try),
+    and the body read must be capped so a hostile client can't make us allocate
+    gigabytes. These exercise the pure read_request_body helper plus do_POST end
+    to end with mocked rfile/wfile so no live socket is needed.
+    """
+
+    # ---- pure helper: read_request_body ----
+
+    def test_bad_content_length_raises(self):
+        """Non-integer Content-Length → BadContentLength (caller maps to 400)."""
+        headers = {"Content-Length": "not-a-number"}
+        with self.assertRaises(scheduler.BadContentLength):
+            scheduler.read_request_body(headers, io.BytesIO(b"abc"))
+
+    def test_negative_content_length_raises(self):
+        """A negative length is malformed/hostile → BadContentLength (400)."""
+        headers = {"Content-Length": "-5"}
+        with self.assertRaises(scheduler.BadContentLength):
+            scheduler.read_request_body(headers, io.BytesIO(b"abc"))
+
+    def test_oversized_content_length_raises_before_read(self):
+        """Length past the cap → BodyTooLarge (413), and we must NOT read the body
+        (no giant allocation). rfile.read is left untouched."""
+        headers = {"Content-Length": str(scheduler.MAX_WEBHOOK_BODY + 1)}
+        rfile = MagicMock()
+        with self.assertRaises(scheduler.BodyTooLarge):
+            scheduler.read_request_body(headers, rfile)
+        rfile.read.assert_not_called()
+
+    def test_missing_content_length_reads_nothing(self):
+        """No header → treated as zero-length body, returns b'' without reading."""
+        rfile = MagicMock()
+        body = scheduler.read_request_body({}, rfile)
+        self.assertEqual(body, b"")
+        rfile.read.assert_not_called()
+
+    def test_valid_content_length_reads_exact_bytes(self):
+        """Happy path: reads exactly Content-Length bytes."""
+        payload = b'{"eventType":"Test"}'
+        headers = {"Content-Length": str(len(payload))}
+        body = scheduler.read_request_body(headers, io.BytesIO(payload))
+        self.assertEqual(body, payload)
+
+    def test_exactly_at_cap_is_allowed(self):
+        """Boundary: Content-Length == cap is allowed (only strictly larger is 413)."""
+        headers = {"Content-Length": str(scheduler.MAX_WEBHOOK_BODY)}
+        rfile = MagicMock()
+        rfile.read.return_value = b"x"  # don't actually allocate a MiB
+        scheduler.read_request_body(headers, rfile)
+        rfile.read.assert_called_once_with(scheduler.MAX_WEBHOOK_BODY)
+
+    # ---- do_POST behavior via a handler built without a real socket ----
+
+    def _make_handler(self, headers, rfile):
+        """Build a WebhookHandler without invoking BaseHTTPRequestHandler.__init__
+        (which would try to service a real connection). We only need the do_POST
+        path, so we attach the attributes it touches and capture _respond calls."""
+        handler = scheduler.WebhookHandler.__new__(scheduler.WebhookHandler)
+        handler.headers = headers
+        handler.rfile = rfile
+        handler.wfile = io.BytesIO()
+        handler._responses = []
+        handler._respond = lambda code, data: handler._responses.append((code, data))
+        return handler
+
+    def test_do_post_malformed_length_returns_400(self):
+        handler = self._make_handler({"Content-Length": "garbage"}, io.BytesIO(b""))
+        handler.do_POST()
+        self.assertEqual(handler._responses[-1][0], 400)
+
+    def test_do_post_oversized_returns_413(self):
+        handler = self._make_handler(
+            {"Content-Length": str(scheduler.MAX_WEBHOOK_BODY + 1)}, MagicMock()
+        )
+        handler.do_POST()
+        self.assertEqual(handler._responses[-1][0], 413)
+
+    def test_do_post_malformed_json_returns_500_not_crash(self):
+        """Valid Content-Length but non-JSON body falls into the catch-all and
+        returns 500 — must not raise out of the handler."""
+        payload = b"this is not json{{{"
+        handler = self._make_handler(
+            {"Content-Length": str(len(payload))}, io.BytesIO(payload)
+        )
+        handler.do_POST()
+        self.assertEqual(handler._responses[-1][0], 500)
+
+    def test_do_post_test_event_returns_200(self):
+        payload = b'{"eventType":"Test"}'
+        handler = self._make_handler(
+            {"Content-Length": str(len(payload))}, io.BytesIO(payload)
+        )
+        handler.do_POST()
+        self.assertEqual(handler._responses[-1], (200, {"status": "ok"}))
+
+    def test_server_is_threading_and_daemon_capable(self):
+        """ThreadingHTTPServer so one stuck client can't block health checks; the
+        handler carries a per-request timeout so a half-open socket can't pin a
+        thread forever."""
+        from http.server import ThreadingHTTPServer
+        self.assertIs(scheduler.ThreadingHTTPServer, ThreadingHTTPServer)
+        self.assertEqual(scheduler.WebhookHandler.timeout, scheduler.WEBHOOK_REQUEST_TIMEOUT)
+
+
+class SchedulerChildShutdownTests(unittest.TestCase):
+    """Item 4 / P2-8: graceful child shutdown.
+
+    On container stop the SIGTERM handler must forward terminate() to the live
+    child subprocess so it stops cleanly within stop_grace_period instead of being
+    SIGKILLed mid-write (half-applied Sonarr monitoring). We use a real short-lived
+    child (`python -c "import time; time.sleep(...)"`) to verify tracking +
+    termination without mocking subprocess internals.
+    """
+
+    def setUp(self):
+        # Ensure a clean tracking set for each test.
+        with scheduler._children_lock:
+            scheduler._live_children.clear()
+
+    def test_run_tracked_returns_completed_process(self):
+        """Normal completion: returns a process with returncode, untracked after."""
+        proc = scheduler._run_tracked([sys.executable, "-c", "pass"], timeout=30)
+        self.assertEqual(proc.returncode, 0)
+        with scheduler._children_lock:
+            self.assertEqual(len(scheduler._live_children), 0)
+
+    def test_run_tracked_preserves_nonzero_returncode(self):
+        proc = scheduler._run_tracked([sys.executable, "-c", "import sys; sys.exit(3)"], timeout=30)
+        self.assertEqual(proc.returncode, 3)
+
+    def test_run_tracked_timeout_raises_and_untracks(self):
+        """Overrunning the timeout raises TimeoutExpired (matching subprocess.run)
+        and the killed child is removed from the live set."""
+        with self.assertRaises(subprocess.TimeoutExpired):
+            scheduler._run_tracked([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
+        with scheduler._children_lock:
+            self.assertEqual(len(scheduler._live_children), 0)
+
+    def test_shutdown_signal_terminates_live_child(self):
+        """The crux of P2-8: while a child is running in _run_tracked on a worker
+        thread, invoking the SIGTERM handler must terminate() that child so the
+        blocked .wait() returns promptly (non-zero, signalled) instead of waiting
+        out the full timeout."""
+        # Reset the module-level event so the handler's set() is observable here.
+        scheduler.shutdown_event.clear()
+        results = {}
+
+        def worker():
+            try:
+                results["proc"] = scheduler._run_tracked(
+                    [sys.executable, "-c", "import time; time.sleep(30)"], timeout=60
+                )
+            except BaseException as e:  # pragma: no cover - shouldn't happen
+                results["error"] = e
+
+        t = threading.Thread(target=worker)
+        t.start()
+
+        # Wait until the child is registered as live.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with scheduler._children_lock:
+                if scheduler._live_children:
+                    break
+            time.sleep(0.02)
+        with scheduler._children_lock:
+            self.assertTrue(scheduler._live_children, "child was never registered as live")
+
+        # Invoke the real signal handler (as the kernel would on SIGTERM).
+        scheduler._handle_shutdown_signal(signal.SIGTERM, None)
+
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "worker did not finish — child was not terminated")
+        self.assertTrue(scheduler.shutdown_event.is_set())
+        self.assertNotIn("error", results)
+        # Child was killed by signal → negative returncode (e.g. -SIGTERM).
+        self.assertLess(results["proc"].returncode, 0)
+        # And it's no longer tracked.
+        with scheduler._children_lock:
+            self.assertEqual(len(scheduler._live_children), 0)
+
+        scheduler.shutdown_event.clear()  # leave global state clean for other tests
 
 
 if __name__ == "__main__":

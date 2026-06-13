@@ -10,7 +10,7 @@ import sys
 import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 import json
 
@@ -73,8 +73,54 @@ trakt_lock = threading.Lock()
 # Signalled from SIGTERM/SIGINT handlers; loops poll this instead of sleeping blindly
 shutdown_event = threading.Event()
 
+# Live child subprocesses (Popen objects). The SIGTERM/SIGINT handler forwards the
+# signal to these so a child mid-write (e.g. Sonarr monitoring flips) gets a prompt,
+# clean stop within the container's stop_grace_period instead of being SIGKILLed.
+# Guarded by _children_lock. set/discard are async-signal-safe enough for our use:
+# the handler only iterates a snapshot and calls terminate() (a single kill(2)).
+_children_lock = threading.Lock()
+_live_children = set()
+
+# Max request body we will read from a webhook client. Sonarr's SeriesAdd payloads
+# are a few KiB; anything past this is almost certainly malformed/hostile.
+MAX_WEBHOOK_BODY = 1 * 1024 * 1024  # 1 MiB
+# Per-request socket timeout so a half-open / slow-loris connection can't pin a
+# handler thread forever.
+WEBHOOK_REQUEST_TIMEOUT = 30
+
 # Thread pool for webhook handling
 webhook_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="webhook")
+
+
+def _run_tracked(cmd, timeout):
+    """Run a child process, registering it so the shutdown handler can terminate it.
+
+    Mirrors subprocess.run(cmd, timeout=timeout) semantics: returns the completed
+    process (with .returncode), raises subprocess.TimeoutExpired if it overruns,
+    and propagates other exceptions. The difference is that the live Popen is
+    tracked in _live_children, so a SIGTERM/SIGINT received while we're blocked in
+    .wait() forwards a terminate() to the child for a clean stop.
+    """
+    proc = subprocess.Popen(cmd)
+    with _children_lock:
+        _live_children.add(proc)
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Match subprocess.run's behavior: kill the child, reap it, re-raise.
+            proc.kill()
+            proc.wait()
+            raise
+        except BaseException:
+            # On any other interruption (incl. KeyboardInterrupt), don't leak the child.
+            proc.kill()
+            proc.wait()
+            raise
+        return proc
+    finally:
+        with _children_lock:
+            _live_children.discard(proc)
 
 
 def run_poll_script(args=None):
@@ -88,7 +134,7 @@ def run_poll_script(args=None):
         if args:
             cmd.extend(args)
         log.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=SCRIPT_TIMEOUT)
+        result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
         if result.returncode != 0:
             log.error(f"Script exited with code {result.returncode}")
             return False
@@ -112,7 +158,7 @@ def run_playback_script():
     try:
         cmd = [sys.executable, "/app/media_automation.py", "playback"]
         log.debug(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=PLAYBACK_SCRIPT_TIMEOUT)
+        result = _run_tracked(cmd, timeout=PLAYBACK_SCRIPT_TIMEOUT)
         if result.returncode != 0:
             log.error(f"Playback script exited with code {result.returncode}")
             return False
@@ -134,7 +180,7 @@ def run_webhook_script(series_id):
         try:
             cmd = [sys.executable, "/app/media_automation.py", "webhook", str(series_id)]
             log.info(f"Running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=False, text=True, timeout=SCRIPT_TIMEOUT)
+            result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
             if result.returncode != 0:
                 log.error(f"Webhook script exited with code {result.returncode}")
                 return False
@@ -153,15 +199,58 @@ def process_webhook_series(series_id):
     run_webhook_script(series_id)
 
 
+class BadContentLength(Exception):
+    """Content-Length header missing/non-integer/negative → answer with 400."""
+
+
+class BodyTooLarge(Exception):
+    """Content-Length exceeds MAX_WEBHOOK_BODY → answer with 413."""
+
+
+def read_request_body(headers, rfile, max_bytes=MAX_WEBHOOK_BODY):
+    """Parse Content-Length and read exactly that many bytes from rfile.
+
+    Pure helper so it can be unit-tested without a live socket. Raises
+    BadContentLength for a malformed/negative length and BodyTooLarge for one
+    that exceeds max_bytes — callers translate those into 400 / 413 responses.
+    Returns the raw body bytes (possibly empty).
+    """
+    raw = headers.get('Content-Length', '0')
+    try:
+        content_length = int(raw)
+    except (TypeError, ValueError):
+        raise BadContentLength(f"non-integer Content-Length: {raw!r}")
+    if content_length < 0:
+        raise BadContentLength(f"negative Content-Length: {content_length}")
+    if content_length > max_bytes:
+        raise BodyTooLarge(f"Content-Length {content_length} exceeds cap {max_bytes}")
+    return rfile.read(content_length) if content_length else b""
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     """Handle incoming webhooks from Sonarr."""
 
+    # Per-request socket timeout (used by BaseHTTPRequestHandler.handle / setup).
+    # A half-open or slow client gets its socket torn down instead of pinning a
+    # handler thread indefinitely.
+    timeout = WEBHOOK_REQUEST_TIMEOUT
+
     def do_POST(self):
         """Handle POST requests (Sonarr webhooks)."""
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
-
+        # Parse Content-Length and read the body INSIDE the try so a malformed or
+        # oversized header returns a clean 400/413 instead of an unhandled traceback.
         try:
+            try:
+                body = read_request_body(self.headers, self.rfile)
+            except BadContentLength as e:
+                log.warning(f"Webhook rejected: {e}")
+                self._respond(400, {"status": "error", "message": "invalid Content-Length"})
+                return
+            except BodyTooLarge as e:
+                log.warning(f"Webhook rejected: {e}")
+                self._respond(413, {"status": "error", "message": "request body too large"})
+                return
+
             data = json.loads(body) if body else {}
             event_type = data.get("eventType", "unknown")
             series_data = data.get("series", {})
@@ -228,7 +317,7 @@ def run_trakt_script(args=None):
         if args:
             cmd.extend(args)
         log.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=TRAKT_SCRIPT_TIMEOUT)
+        result = _run_tracked(cmd, timeout=TRAKT_SCRIPT_TIMEOUT)
         if result.returncode != 0:
             log.error(f"Trakt script exited with code {result.returncode}")
             return False
@@ -244,7 +333,23 @@ def run_trakt_script(args=None):
 
 
 def playback_check_loop():
-    """Background loop that checks for active playback every N seconds."""
+    """Background loop that checks for active playback every N seconds.
+
+    TODO (P2-10, deferred): each iteration shells out to a fresh
+    `python /app/media_automation.py playback` subprocess via run_playback_script().
+    With the default PLAYBACK_CHECK_INTERVAL=45s that is ~1900 cold Python
+    interpreter starts/day, each of which re-imports the module and re-opens the
+    SQLite DB and a new HTTP connection to Jellyfin/Sonarr just to poll for active
+    sessions — pure overhead for a check that is usually a no-op.
+
+    Recommended future direction: run the playback poll in-process here, reusing a
+    single long-lived sqlite3 connection and one requests.Session (keep-alive) across
+    iterations instead of spawning a subprocess. That work is intentionally NOT done
+    in this change because the playback logic lives in media_automation.py (owned by
+    a sibling change) and refactoring it for safe in-process reuse — connection
+    lifecycle, thread-safety with the webhook/poll paths, DRY_RUN handling — is the
+    riskiest part. Keep the subprocess model until that migration is scoped.
+    """
     log.info(f"Playback check loop started (interval: {PLAYBACK_CHECK_INTERVAL}s)")
     while not shutdown_event.is_set():
         try:
@@ -272,9 +377,39 @@ def trakt_discovery_loop():
 
 
 def _handle_shutdown_signal(signum, frame):
-    """SIGTERM/SIGINT handler — sets the shutdown_event so all loops can exit cleanly."""
+    """SIGTERM/SIGINT handler — sets the shutdown_event so all loops can exit cleanly,
+    and forwards a terminate() to any live child subprocess.
+
+    Why this is safe to do from a signal handler: Python only runs signal handlers
+    between bytecode instructions on the main thread, never re-entrantly mid-opcode.
+    The one deadlock risk would be the handler firing while the main thread already
+    holds _children_lock (inside _run_tracked's brief add/discard window). We avoid
+    that by acquiring the lock non-blocking: if we can't get it, we fall back to a
+    best-effort snapshot. The lock is only ever held for a couple of bytecodes
+    (set.add / set.discard), never across proc.wait(), so cross-thread contention
+    here is negligible. We do the minimum: snapshot the live children, then
+    terminate() each (a single SIGTERM via kill(2)) — no heavy/reentrant work. The
+    blocked run_* helper's proc.wait() then returns promptly, the child exits cleanly
+    inside stop_grace_period instead of being SIGKILLed mid-write, and shutdown_event
+    lets the loops stop.
+    """
     log.info(f"Received signal {signum}, beginning graceful shutdown")
     shutdown_event.set()
+    if _children_lock.acquire(blocking=False):
+        try:
+            children = list(_live_children)
+        finally:
+            _children_lock.release()
+    else:
+        # Couldn't grab the lock (we likely interrupted our own add/discard). Take a
+        # best-effort copy; tuple() over a set is a single C-level op and the set is
+        # only mutated under the lock, so this is safe enough for a one-shot signal.
+        children = list(tuple(_live_children))
+    for proc in children:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 def main():
@@ -294,10 +429,15 @@ def main():
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    # Build webhook HTTPServer up front so we hold a reference for .shutdown()
+    # Build webhook server up front so we hold a reference for .shutdown().
+    # ThreadingHTTPServer handles each request in its own thread, so one slow or
+    # stuck client can't block health checks (do_GET) or other webhooks. The worker
+    # threads are daemons (daemon_threads=True) so a pending request can't block a
+    # clean process exit.
     webhook_server = None
     try:
-        webhook_server = HTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+        webhook_server = ThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+        webhook_server.daemon_threads = True
     except OSError as e:
         log.error(f"Failed to start webhook server on port {WEBHOOK_PORT}: {e}")
         log.error("Continuing with polling-only mode")
