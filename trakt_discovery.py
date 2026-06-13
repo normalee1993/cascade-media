@@ -1372,19 +1372,19 @@ def cmd_status(conn):
             print(f"Token: Valid ({days_left} days until expiry)")
             if days_left <= 1:
                 print(f"  !! DANGER: expires in {days_left} days — re-auth may be needed soon")
-                print(f"  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+                print(f"  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
             elif days_left <= 3:
                 print(f"  Warning: expires in {days_left} days (auto-refresh will trigger soon)")
         else:
             print("Token: EXPIRED — run 'auth' to re-authenticate")
-            print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+            print("  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
         row = conn.execute("SELECT created_at FROM trakt_tokens WHERE id = 1").fetchone()
         if row and row[0]:
             last_refreshed = row[0][:19].replace("T", " ") + " UTC"
             print(f"  Last refreshed: {last_refreshed}")
     else:
         print("Token: Not configured — run 'auth' to authenticate")
-        print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+        print("  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
 
     # Discovery stats
     row = conn.execute("SELECT COUNT(*) FROM trakt_discovered").fetchone()
