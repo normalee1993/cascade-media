@@ -303,7 +303,10 @@ def _send_alert_webhook(message, subject="Token refresh failure"):
             requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
             log.info("Alert webhook sent")
         except Exception as e:
-            log.warning(f"Alert webhook failed: {e}")
+            # The exception string can embed the full ALERT_WEBHOOK_URL, which
+            # for Discord/Slack includes a secret token. Log only the exception
+            # type so the token never lands in `docker logs`.
+            log.warning(f"Alert webhook failed: {type(e).__name__}")
     _send_alert_email(subject, message)
 
 

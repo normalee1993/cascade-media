@@ -513,5 +513,59 @@ class CascadeApplyMonitoringTests(unittest.TestCase):
                          f"expected only the series PUT; got {endpoints}")
 
 
+class SecretLogRedactionTests(unittest.TestCase):
+    """Secrets must never reach `docker logs`. requests embeds the full request
+    URL in its exception strings, so a naive `log.error(f"...: {e}")` leaks:
+      - SABnzbd's ?apikey=<KEY> query param (media_automation.sabnzbd_api)
+      - Discord/Slack's secret webhook token (trakt_discovery._send_alert_webhook)
+    These guards simulate a ConnectionError carrying the secret-laden URL and
+    assert the secret is absent from every captured log record."""
+
+    SAB_KEY = "deadbeefcafe1234567890sabnzbdkey"
+    WEBHOOK_TOKEN = "AbCdEf-SuperSecretDiscordToken-123456"
+
+    def test_sabnzbd_api_key_not_logged_on_connection_error(self):
+        """ConnectionError whose message includes ?apikey=<KEY> (exactly how
+        requests surfaces a failed GET) must not leak the key into the log."""
+        url = "http://sab.local:8080/api"
+        leaky = requests.exceptions.ConnectionError(
+            f"HTTPConnectionPool: failed connecting to "
+            f"{url}?apikey={self.SAB_KEY}&mode=queue&output=json"
+        )
+        with patch.object(media_automation, "SABNZBD_URL", "http://sab.local:8080"), \
+             patch.object(media_automation, "SABNZBD_API_KEY", self.SAB_KEY), \
+             patch.object(media_automation.requests, "get", side_effect=leaky):
+            with self.assertLogs(media_automation.log, level="ERROR") as cm:
+                result = media_automation.sabnzbd_api("queue")
+
+        self.assertIsNone(result)
+        joined = "\n".join(cm.output)
+        self.assertNotIn(self.SAB_KEY, joined)
+        self.assertNotIn("apikey=", joined)
+        # Still useful for debugging: names the failure type and the mode.
+        self.assertIn("ConnectionError", joined)
+        self.assertIn("mode=queue", joined)
+
+    def test_alert_webhook_token_not_logged_on_post_failure(self):
+        """A failed alert POST must not leak the secret token embedded in
+        ALERT_WEBHOOK_URL (Discord/Slack put a token in the path)."""
+        webhook = f"https://discord.com/api/webhooks/123456789/{self.WEBHOOK_TOKEN}"
+        leaky = requests.exceptions.ConnectionError(
+            f"HTTPSConnectionPool: failed connecting to {webhook}"
+        )
+        with patch.object(trakt_discovery, "ALERT_WEBHOOK_URL", webhook), \
+             patch.object(trakt_discovery, "_send_alert_email"), \
+             patch.object(trakt_discovery.requests, "post", side_effect=leaky):
+            with self.assertLogs(trakt_discovery.log, level="WARNING") as cm:
+                trakt_discovery._send_alert_webhook("token refresh failed")
+
+        joined = "\n".join(cm.output)
+        self.assertNotIn(self.WEBHOOK_TOKEN, joined)
+        self.assertNotIn(webhook, joined)
+        # The failure is still reported, just without the secret.
+        self.assertIn("Alert webhook failed", joined)
+        self.assertIn("ConnectionError", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

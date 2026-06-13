@@ -194,7 +194,11 @@ def sabnzbd_api(mode, params=None):
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.error(f"SABnzbd API error (mode={mode}): {e}")
+        # The exception string can embed the full request URL, which includes
+        # ?apikey=<SABNZBD_API_KEY> as a query param. Logging it verbatim leaks
+        # the key into `docker logs`. Log only the exception type and the
+        # query-stripped base URL instead.
+        log.error(f"SABnzbd API error (mode={mode}): {type(e).__name__} on {url}")
         return None
 
 
