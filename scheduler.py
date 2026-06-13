@@ -30,7 +30,7 @@ def get_int_env(key, default):
         return default
 
 INTERVAL_MINUTES = get_int_env("RUN_INTERVAL_MINUTES", 15)
-RUN_CATCHUP_ON_START = os.getenv("RUN_CATCHUP_ON_START", "true").lower() == "true"
+RUN_CATCHUP_ON_START = os.getenv("RUN_CATCHUP_ON_START", "false").lower() == "true"
 WEBHOOK_PORT = get_int_env("WEBHOOK_PORT", 9191)
 SCRIPT_TIMEOUT = get_int_env("SCRIPT_TIMEOUT_MINUTES", 30) * 60
 PLAYBACK_CHECK_INTERVAL = get_int_env("PLAYBACK_CHECK_INTERVAL", 45)
