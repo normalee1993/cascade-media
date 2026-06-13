@@ -89,6 +89,22 @@ SONARR_HEADERS = {"X-Api-Key": SONARR_API_KEY, "Content-Type": "application/json
 JELLYFIN_HEADERS = {"X-Emby-Token": JELLYFIN_API_KEY, "Content-Type": "application/json"}
 SEERR_HEADERS = {"X-Api-Key": SEERR_API_KEY, "Content-Type": "application/json"}
 
+
+def _parse_retry_after(headers, default=60):
+    """Parse a Retry-After header into seconds.
+
+    Per RFC 7231 the header may be either a non-negative integer (delay seconds)
+    or an HTTP-date. int() chokes on the date form and would crash the whole
+    retry loop, so fall back to the default for anything non-numeric.
+    """
+    raw = headers.get('Retry-After', default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning(f"Non-numeric Retry-After header '{raw}', using {default}s")
+        return default
+
+
 def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
     """Make API request with retry logic for transient failures."""
     for attempt in range(max_retries):
@@ -97,7 +113,7 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
 
             # Handle rate limiting
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
+                retry_after = _parse_retry_after(resp.headers, 60)
                 log.warning(f"Rate limited, waiting {retry_after}s before retry")
                 time.sleep(retry_after)
                 continue
@@ -373,6 +389,36 @@ def init_db():
     raise sqlite3.OperationalError("Failed to initialize database after all retries")
 
 
+def check_db_writable(conn):
+    """Probe DB writability before doing work that depends on persistence.
+
+    Mirrors trakt_discovery.check_db_writable but is intentionally self-contained
+    (media_automation has no alert infra, and must not import trakt_discovery).
+
+    On a bind-mounted DB that is root-owned while the container runs as uid 99,
+    SQLite opens the file read-only. init_db's CREATE TABLE IF NOT EXISTS would
+    then crash every cycle with a cryptic "attempt to write a readonly database".
+    This probe surfaces the readonly state loudly and lets the run skip cleanly.
+
+    Returns True if writable, False (after logging an actionable message) if not.
+    """
+    try:
+        # PRAGMA user_version = X writes the DB header even when X is unchanged,
+        # reproducing the exact readonly error path without mutating any data.
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.execute(f"PRAGMA user_version = {int(current)}")
+        return True
+    except sqlite3.OperationalError as e:
+        log.error(
+            f"Database is READONLY: {e}\n"
+            "Monitoring/unlock/boost state cannot be persisted; skipping run.\n"
+            "Fix on the Unraid host:\n"
+            "  chown 99:users /mnt/user/appdata/media-automation/data/media_automation.db\n"
+            "  chmod 664 /mnt/user/appdata/media-automation/data/media_automation.db"
+        )
+        return False
+
+
 def is_series_processed(conn, sonarr_id):
     """Return True only if this series is FULLY set up (status='done').
 
@@ -529,6 +575,9 @@ def set_initial_monitoring(conn):
     log.info("=== Checking for newly added series ===")
 
     all_series = sonarr_get("/series")
+    if not isinstance(all_series, list):
+        log.warning("Sonarr /series returned no usable list; skipping new-series check this cycle")
+        return
     cutoff = datetime.now(timezone.utc) - timedelta(hours=NEW_SERIES_LOOKBACK_HOURS)
 
     newly_added = []
@@ -671,6 +720,12 @@ def apply_monitoring(series_id, title, episodes, target_seasons, all_seasons):
     # setting them True causes Sonarr to re-monitor every episode within and
     # undo our preview-only setup.
     series_detail = sonarr_get(f"/series/{series_id}")
+    if not isinstance(series_detail, dict):
+        # Without the series body we cannot flip the season-level monitored gate
+        # (which MUST go first). Bail rather than push a None body or apply
+        # episode flips without the gate and trigger unwanted Sonarr searches.
+        log.warning(f"  Could not fetch series detail for {title} (id {series_id}); skipping monitoring update this pass")
+        return 0
     for season_info in series_detail.get("seasons", []):
         sn = season_info["seasonNumber"]
         season_info["monitored"] = sn in target_seasons
@@ -760,8 +815,14 @@ def process_new_series(conn, series):
         if not DRY_RUN:
             log.info(f"  Waiting 15s for Sonarr to finish initial processing...")
             time.sleep(15)
-            # Re-fetch and re-apply in case Sonarr re-monitored during initial processing
-            episodes = sonarr_get(f"/episode?seriesId={series_id}")
+            # Re-fetch and re-apply in case Sonarr re-monitored during initial processing.
+            # If the re-fetch returns no usable list, keep the prior good episodes
+            # rather than passing None into apply_monitoring (which would crash).
+            refetched = sonarr_get(f"/episode?seriesId={series_id}")
+            if isinstance(refetched, list) and refetched:
+                episodes = refetched
+            else:
+                log.warning(f"  Episode re-fetch for {title} returned no usable list; reusing prior snapshot")
             apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
 
         # Trigger search ONLY for the target seasons (not the whole series)
@@ -802,8 +863,11 @@ def process_new_series(conn, series):
             for delay in [10, 20, 30]:
                 try:
                     time.sleep(delay)
-                    # Re-fetch and re-apply monitoring each pass
-                    episodes = sonarr_get(f"/episode?seriesId={series_id}")
+                    # Re-fetch and re-apply monitoring each pass. Reuse the prior
+                    # snapshot if a pass returns no usable list (don't pass None on).
+                    refetched = sonarr_get(f"/episode?seriesId={series_id}")
+                    if isinstance(refetched, list) and refetched:
+                        episodes = refetched
                     apply_monitoring(series_id, title, episodes, target_seasons, all_seasons)
                     cleanup_unwanted_queue_items(series_id, title)
                 except Exception as e:
@@ -857,6 +921,10 @@ def cleanup_unwanted_queue_items(series_id, title):
         episodes = sonarr_get(f"/episode?seriesId={series_id}")
     except Exception as e:
         log.warning(f"  Failed to get episodes for queue cleanup: {e}")
+        return 0
+
+    if not isinstance(episodes, list):
+        log.warning(f"  No usable episode list for queue cleanup of {title}; skipping")
         return 0
 
     unmonitored_episode_ids = set()
@@ -917,6 +985,9 @@ def check_watch_progress(conn):
     log.info("=== Checking watch progress across all users ===")
 
     all_series = sonarr_get("/series")
+    if not isinstance(all_series, list):
+        log.warning("Sonarr /series returned no usable list; skipping watch-progress check this cycle")
+        return
 
     series_by_title = {}
     series_by_tvdb = {}
@@ -1094,6 +1165,9 @@ def process_existing_series(conn):
     log.info("=== Processing existing series (catch-up) ===")
 
     all_series = sonarr_get("/series")
+    if not isinstance(all_series, list):
+        log.warning("Sonarr /series returned no usable list; skipping catch-up this run")
+        return
     unprocessed = [s for s in all_series if not is_series_processed(conn, s["id"])]
 
     if not unprocessed:
@@ -1109,6 +1183,9 @@ def process_existing_series(conn):
         # not abort the whole catch-up batch and does not leave a show locked.
         try:
             episodes = sonarr_get(f"/episode?seriesId={series_id}")
+            if not isinstance(episodes, list):
+                log.warning(f"  No usable episode list for {title} (id {series_id}); skipping (will retry next run)")
+                continue
             has_files = any(ep.get("hasFile") for ep in episodes)
 
             if has_files:
@@ -1217,6 +1294,10 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
         episodes = sonarr_get(f"/episode?seriesId={series_id}")
     except Exception as e:
         log.warning(f"  Failed to get episodes for priority boost: {e}")
+        return
+
+    if not isinstance(episodes, list):
+        log.warning(f"  No usable episode list for priority boost of {title} S{season_number:02d}; skipping")
         return
 
     ep_number_map = {}
@@ -1339,6 +1420,9 @@ def check_active_playback(conn):
     # Pre-fetch Sonarr series data to avoid lazy loading in loop
     try:
         all_series = sonarr_get("/series")
+        if not isinstance(all_series, list):
+            log.warning("Sonarr /series returned no usable list; skipping playback check this cycle")
+            return
         series_by_title = {}
         series_by_tvdb = {}
         for s in all_series:
@@ -1408,6 +1492,9 @@ def check_active_playback(conn):
 
         # Unlock the full season
         sonarr_episodes = sonarr_get(f"/episode?seriesId={sonarr_id}")
+        if not isinstance(sonarr_episodes, list):
+            log.warning(f"  No usable episode list for {series_name}; skipping playback unlock this cycle")
+            continue
         season_episodes = [e for e in sonarr_episodes if e.get("seasonNumber") == season_number]
 
         if not season_episodes:
@@ -1444,14 +1531,41 @@ def check_active_playback(conn):
 # DATABASE CLEANUP
 # ============================================================
 def cleanup_stale_db_entries(conn):
-    """Remove DB entries for series that no longer exist in Sonarr."""
+    """Remove DB entries for series that no longer exist in Sonarr.
+
+    This DELETEs every DB row whose series isn't in the Sonarr snapshot, so a
+    partial/empty/None response would wipe processed/unlock/boost state and
+    trigger mass reprocessing of the whole library. Guard against that: never
+    mass-delete from a suspect snapshot — only act on a snapshot that is
+    plausibly the full series list.
+    """
     try:
         all_series = sonarr_get("/series")
+
+        # Plausibility guard 1: response must be a non-empty list. None (decode
+        # error / no usable body) or [] (truncated/empty) is never a valid basis
+        # for deletion — an empty Sonarr would mean "the user really has zero
+        # series", which is indistinguishable from a failed fetch, so skip.
+        if not isinstance(all_series, list) or not all_series:
+            log.warning("Skipping stale-DB cleanup: Sonarr /series returned no usable list (refusing to mass-delete from a suspect snapshot)")
+            return
+
         active_ids = {s["id"] for s in all_series}
 
         c = conn.cursor()
         c.execute("SELECT sonarr_id, title FROM processed_series")
         rows = c.fetchall()
+
+        # Plausibility guard 2: if the DB tracks series but the snapshot overlaps
+        # with NONE of them, the snapshot is almost certainly truncated/wrong
+        # rather than a legitimate wholesale library change. Bailing here avoids
+        # wiping every processed/unlock/boost row at once.
+        if rows and not any(sid in active_ids for sid, _ in rows):
+            log.warning(
+                f"Skipping stale-DB cleanup: none of {len(rows)} tracked series "
+                f"appear in the {len(active_ids)}-item Sonarr snapshot (likely truncated)"
+            )
+            return
 
         stale_ids = [(sid, title) for sid, title in rows if sid not in active_ids]
         if not stale_ids:
@@ -1493,6 +1607,8 @@ def run_once():
     conn = init_db()
 
     try:
+        if not check_db_writable(conn):
+            return
         set_initial_monitoring(conn)
         check_watch_progress(conn)
         cleanup_stale_db_entries(conn)
@@ -1509,6 +1625,8 @@ def run_catchup():
     log.info("Running one-time catch-up for existing series...")
     conn = init_db()
     try:
+        if not check_db_writable(conn):
+            return
         process_existing_series(conn)
     except Exception as e:
         log.error(f"Error during catch-up: {e}", exc_info=True)
@@ -1520,6 +1638,8 @@ def run_webhook(series_id):
     """Process a single series triggered by webhook."""
     conn = init_db()
     try:
+        if not check_db_writable(conn):
+            return
         process_single_series(conn, series_id)
     except Exception as e:
         log.error(f"Error during webhook processing: {e}", exc_info=True)
@@ -1531,6 +1651,8 @@ def run_playback():
     """Check active Jellyfin playback and boost priorities."""
     conn = init_db()
     try:
+        if not check_db_writable(conn):
+            return
         check_active_playback(conn)
     except Exception as e:
         log.error(f"Error during playback check: {e}", exc_info=True)

@@ -987,6 +987,243 @@ class AtomicClaimTests(unittest.TestCase):
             self.assertEqual(self._row(conn, 25)[0], "in_progress")
         finally:
             conn.close()
+class ApiNoneResponseContractTests(unittest.TestCase):
+    """P2-1: _api_request_with_retry returns None for a JSON-decode failure /
+    no usable body. Callers iterate the result as a list/dict, so an unguarded
+    None throws 'NoneType is not iterable' and aborts the whole cycle. Each
+    iterating call site must log + skip instead of crashing."""
+
+    def test_set_initial_monitoring_skips_on_none_series(self):
+        with patch.object(media_automation, "sonarr_get", return_value=None):
+            # Must not raise; with no series list there is nothing to process.
+            media_automation.set_initial_monitoring(conn=MagicMock())
+
+    def test_check_watch_progress_skips_on_none_series(self):
+        with patch.object(media_automation, "sonarr_get", return_value=None), \
+             patch.object(media_automation, "check_user_progress") as mock_progress:
+            media_automation.check_watch_progress(conn=MagicMock())
+        # Bailed before the per-user loop — no progress checks attempted.
+        mock_progress.assert_not_called()
+
+    def test_process_existing_series_skips_on_none_series(self):
+        with patch.object(media_automation, "sonarr_get", return_value=None):
+            media_automation.process_existing_series(conn=MagicMock())
+
+    def test_check_active_playback_skips_on_none_series(self):
+        # Sessions returns a playing episode; the Sonarr /series fetch returns
+        # None. The handler must bail cleanly rather than iterate None.
+        def fake_get(endpoint, *a, **k):
+            if endpoint == "/Sessions":
+                return [{"NowPlayingItem": {"Type": "Episode", "IndexNumber": 1,
+                                            "ParentIndexNumber": 1, "SeriesName": "X"},
+                         "UserId": "u1"}]
+            return None  # /series -> None
+        with patch.object(media_automation, "jellyfin_get", side_effect=fake_get), \
+             patch.object(media_automation, "sonarr_get", return_value=None), \
+             patch.object(media_automation, "JELLYFIN_USER_IDS", ["u1"]):
+            media_automation.check_active_playback(conn=MagicMock())
+
+    def test_cleanup_unwanted_queue_items_skips_on_none_episodes(self):
+        with patch.object(media_automation, "sonarr_get", return_value=None):
+            cancelled = media_automation.cleanup_unwanted_queue_items(1, "Show")
+        self.assertEqual(cancelled, 0)
+
+    def test_boost_season_priority_skips_on_none_episodes(self):
+        # Past the configured/boosted guards: SABnzbd key set, season not yet
+        # boosted, then the episode fetch returns None.
+        conn = MagicMock()
+        with patch.object(media_automation, "SABNZBD_API_KEY", "key"), \
+             patch.object(media_automation, "is_season_boosted", return_value=False), \
+             patch.object(media_automation, "sonarr_get", return_value=None), \
+             patch.object(media_automation, "sabnzbd_get_queue") as mock_sab:
+            media_automation.boost_season_priority(conn, 1, 2, "Show")
+        # Bailed before touching the SABnzbd queue.
+        mock_sab.assert_not_called()
+
+    def test_apply_monitoring_skips_when_series_detail_none(self):
+        """The season-level gate needs the series body; a None detail must abort
+        the update (return 0) rather than PUT a None body or skip the gate."""
+        episodes = [
+            {"id": 1, "seasonNumber": 1, "episodeNumber": 1, "monitored": False, "hasFile": False},
+        ]
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "sonarr_get", return_value=None), \
+             patch.object(media_automation, "sonarr_put") as mock_put:
+            changes = media_automation.apply_monitoring(
+                series_id=1, title="Show", episodes=episodes,
+                target_seasons={1}, all_seasons={1},
+            )
+        self.assertEqual(changes, 0)
+        mock_put.assert_not_called()
+
+
+class CleanupStaleDbGuardTests(unittest.TestCase):
+    """cleanup_stale_db_entries DELETEs every row whose series isn't in the
+    Sonarr snapshot. A partial/empty/None response would wipe processed/unlock/
+    boost state and trigger mass reprocessing. The plausibility guard must skip
+    cleanup entirely on a suspect snapshot — issuing zero DELETEs."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "stale.db")
+        conn = sqlite3.connect(self._db_path)
+        conn.executescript(
+            """
+            CREATE TABLE processed_series (sonarr_id INTEGER PRIMARY KEY, title TEXT, processed_at TEXT);
+            CREATE TABLE unlocked_seasons (sonarr_id INTEGER, season_number INTEGER, unlocked_by TEXT, unlocked_at TEXT);
+            CREATE TABLE priority_boosts (sonarr_id INTEGER, season_number INTEGER, boosted_at TEXT);
+            """
+        )
+        # Seed three processed series.
+        for sid in (10, 20, 30):
+            conn.execute("INSERT INTO processed_series VALUES (?, ?, ?)", (sid, f"Show{sid}", "2026-01-01"))
+            conn.execute("INSERT INTO unlocked_seasons VALUES (?, ?, ?, ?)", (sid, 1, "initial", "2026-01-01"))
+            conn.execute("INSERT INTO priority_boosts VALUES (?, ?, ?)", (sid, 1, "2026-01-01"))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _row_count(self):
+        conn = sqlite3.connect(self._db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM processed_series").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_skips_on_none_series(self):
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with patch.object(media_automation, "sonarr_get", return_value=None):
+                media_automation.cleanup_stale_db_entries(conn)
+        finally:
+            conn.close()
+        self.assertEqual(self._row_count(), 3, "None snapshot must not delete any rows")
+
+    def test_skips_on_empty_series(self):
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with patch.object(media_automation, "sonarr_get", return_value=[]):
+                media_automation.cleanup_stale_db_entries(conn)
+        finally:
+            conn.close()
+        self.assertEqual(self._row_count(), 3, "Empty snapshot must not wipe the DB")
+
+    def test_skips_on_zero_overlap_truncated_snapshot(self):
+        # Snapshot is non-empty but shares NO ids with the DB -> looks truncated.
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with patch.object(media_automation, "sonarr_get",
+                              return_value=[{"id": 999}]):
+                media_automation.cleanup_stale_db_entries(conn)
+        finally:
+            conn.close()
+        self.assertEqual(self._row_count(), 3, "Zero-overlap snapshot must not mass-delete")
+
+    def test_deletes_only_genuinely_stale_rows_on_valid_snapshot(self):
+        # Snapshot overlaps (10, 20 present) and drops 30 -> 30 is genuinely stale.
+        conn = sqlite3.connect(self._db_path)
+        try:
+            with patch.object(media_automation, "sonarr_get",
+                              return_value=[{"id": 10}, {"id": 20}]):
+                media_automation.cleanup_stale_db_entries(conn)
+        finally:
+            conn.close()
+        conn = sqlite3.connect(self._db_path)
+        try:
+            remaining = {r[0] for r in conn.execute("SELECT sonarr_id FROM processed_series")}
+        finally:
+            conn.close()
+        self.assertEqual(remaining, {10, 20}, "Only the genuinely absent series should be removed")
+
+
+class MediaAutomationDbWritabilityProbeTests(unittest.TestCase):
+    """P2-4: media_automation had no readonly-DB probe (unlike trakt_discovery),
+    so a root-owned bind-mount DB crashed init_db every cycle with a cryptic
+    error. check_db_writable mirrors trakt's probe (PRAGMA user_version) and is
+    called at the start of every run_* entrypoint."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "probe.db")
+        seed = sqlite3.connect(self._db_path)
+        seed.execute("CREATE TABLE t (x INTEGER)")
+        seed.commit()
+        seed.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_writable_db_passes(self):
+        conn = sqlite3.connect(self._db_path)
+        try:
+            self.assertTrue(media_automation.check_db_writable(conn))
+        finally:
+            conn.close()
+
+    def test_readonly_db_fails_and_logs(self):
+        """Open via URI in mode=ro. Probe must return False and log an actionable
+        message naming the chown fix."""
+        conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+        try:
+            with self.assertLogs(media_automation.log, level="ERROR") as cm:
+                self.assertFalse(media_automation.check_db_writable(conn))
+            self.assertTrue(any("chown 99:users" in line for line in cm.output),
+                            "readonly message must name the chown fix")
+        finally:
+            conn.close()
+
+
+class RetryAfterParseTests(unittest.TestCase):
+    """P2-12: int(resp.headers.get('Retry-After', 60)) crashes on an HTTP-date
+    value (RFC 7231 allows date OR seconds). A date-form header must fall back to
+    the 60s default instead of aborting the cycle. Covers both modules."""
+
+    @staticmethod
+    def _resp(status, headers):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = headers
+        resp.json.return_value = {"ok": True}
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_media_automation_date_form_retry_after_does_not_raise(self):
+        # First call: 429 with an HTTP-date Retry-After. Second: success.
+        responses = [
+            self._resp(429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._resp(200, {}),
+        ]
+        method = MagicMock(side_effect=responses)
+        with patch.object(media_automation.time, "sleep") as mock_sleep:
+            result = media_automation._api_request_with_retry(method, "http://x", {})
+        self.assertEqual(result, {"ok": True})
+        # Fell back to the 60s default rather than raising.
+        mock_sleep.assert_called_once_with(60)
+
+    def test_media_automation_numeric_retry_after_is_honored(self):
+        responses = [
+            self._resp(429, {"Retry-After": "5"}),
+            self._resp(200, {}),
+        ]
+        method = MagicMock(side_effect=responses)
+        with patch.object(media_automation.time, "sleep") as mock_sleep:
+            media_automation._api_request_with_retry(method, "http://x", {})
+        mock_sleep.assert_called_once_with(5)
+
+    def test_trakt_date_form_retry_after_does_not_raise(self):
+        responses = [
+            self._resp(429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._resp(200, {}),
+        ]
+        method = MagicMock(side_effect=responses)
+        with patch.object(trakt_discovery.time, "sleep") as mock_sleep:
+            result = trakt_discovery._api_request_with_retry(method, "http://x", {})
+        self.assertEqual(result, {"ok": True})
+        mock_sleep.assert_called_once_with(60)
 
 
 if __name__ == "__main__":

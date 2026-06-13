@@ -194,7 +194,15 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
             resp = method(url, headers=headers, timeout=30, **kwargs)
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
+                # Retry-After may be an integer (seconds) or an HTTP-date per
+                # RFC 7231. int() crashes on the date form, aborting the cycle,
+                # so fall back to the 60s default for anything non-numeric.
+                _raw_retry = resp.headers.get('Retry-After', 60)
+                try:
+                    retry_after = int(_raw_retry)
+                except (TypeError, ValueError):
+                    log.warning(f"Non-numeric Retry-After header '{_raw_retry}', using 60s")
+                    retry_after = 60
                 log.warning(f"Rate limited, waiting {retry_after}s before retry")
                 time.sleep(retry_after)
                 continue
