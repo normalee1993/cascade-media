@@ -12,6 +12,7 @@ import json
 import time
 import os
 import sys
+import re
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -211,6 +212,16 @@ def qualifies_for_premium_bypass(source, rating, filter_type):
 # ============================================================
 # API HELPERS
 # ============================================================
+def _redact_secrets(s):
+    """Mask api_key/apikey query-string values so secrets never hit the logs.
+
+    TMDB passes its v3 key as a `?api_key=` query param, so a `requests`
+    exception (whose string contains the full request URL) or a logged URL
+    would otherwise leak the key into `docker logs`.
+    """
+    return re.sub(r"(?i)(api_?key=)[^&\s]+", r"\1REDACTED", str(s))
+
+
 def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
     """Make API request with retry logic for transient failures."""
     for attempt in range(max_retries):
@@ -243,14 +254,14 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
             try:
                 return resp.json()
             except json.JSONDecodeError:
-                log.error(f"Invalid JSON response from {url}: {resp.text[:200]}")
+                log.error(f"Invalid JSON response from {_redact_secrets(url)}: {resp.text[:200]}")
                 return None
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
                 log.warning(f"Request timeout, retrying ({attempt + 1}/{max_retries})")
                 continue
-            log.error(f"Request timed out after {max_retries} attempts: {url}")
+            log.error(f"Request timed out after {max_retries} attempts: {_redact_secrets(url)}")
             raise
         except requests.exceptions.ConnectionError:
             if attempt < max_retries - 1:
@@ -258,10 +269,10 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
                 log.warning(f"Connection error, retrying in {wait_time}s ({attempt + 1}/{max_retries})")
                 time.sleep(wait_time)
                 continue
-            log.error(f"Connection failed after {max_retries} attempts: {url}")
+            log.error(f"Connection failed after {max_retries} attempts: {_redact_secrets(url)}")
             raise
         except requests.exceptions.RequestException as e:
-            log.error(f"API request failed: {url} - {e}")
+            log.error(f"API request failed: {_redact_secrets(url)} - {_redact_secrets(e)}")
             raise
 
     return None
