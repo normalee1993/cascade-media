@@ -1226,5 +1226,91 @@ class RetryAfterParseTests(unittest.TestCase):
         mock_sleep.assert_called_once_with(60)
 
 
+class MigrationConcurrencyTests(unittest.TestCase):
+    """processed_series.status migration — prod incident 2026-06-15.
+
+    The poll and playback subprocesses run init_db simultaneously at startup.
+    Both passed the PRAGMA check, then collided on ALTER, so the loser crashed
+    with 'duplicate column name: status'. _ensure_status_column must (a) add the
+    column + backfill legacy rows to 'done' on an old DB, (b) be a no-op when the
+    column already exists, and (c) swallow the benign concurrent collision while
+    still re-raising unrelated errors.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self._tmp, "m.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _seed_old_schema(self):
+        """processed_series as it existed before the status column, with one row."""
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "CREATE TABLE processed_series (sonarr_id INTEGER PRIMARY KEY, title TEXT, processed_at TEXT)"
+        )
+        conn.execute("INSERT INTO processed_series VALUES (1, 'Legacy Show', '2026-01-01T00:00:00+00:00')")
+        conn.commit()
+        conn.close()
+
+    def test_migrates_old_db_and_backfills_done(self):
+        self._seed_old_schema()
+        with patch.object(media_automation, "DB_PATH", self.db):
+            conn = media_automation.init_db()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(processed_series)")}
+            self.assertIn("status", cols)
+            status = conn.execute("SELECT status FROM processed_series WHERE sonarr_id = 1").fetchone()[0]
+            self.assertEqual(status, "done")  # legacy row treated as already fully set up
+        finally:
+            conn.close()
+
+    def test_init_db_idempotent_on_second_run(self):
+        self._seed_old_schema()
+        with patch.object(media_automation, "DB_PATH", self.db):
+            media_automation.init_db().close()
+            media_automation.init_db().close()  # must not raise 'duplicate column name'
+
+    def test_ensure_status_column_swallows_concurrent_duplicate(self):
+        """Race: PRAGMA shows no status column, but a concurrent process won the
+        ALTER first, so ours raises duplicate-column. Must be swallowed, and the
+        backfill UPDATE must still run."""
+        class RacingCursor:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, sql, *args):
+                self.executed.append(sql)
+                u = " ".join(sql.split()).upper()
+                if u.startswith("PRAGMA TABLE_INFO"):
+                    return []  # no columns -> 'status' looks absent -> proceed to ALTER
+                if "ADD COLUMN STATUS" in u:
+                    raise sqlite3.OperationalError("duplicate column name: status")
+                return []  # UPDATE backfill
+
+        cur = RacingCursor()
+        media_automation._ensure_status_column(cur)  # must NOT raise
+        self.assertTrue(
+            any("UPDATE" in s.upper() for s in cur.executed),
+            "backfill UPDATE should still run after a swallowed collision",
+        )
+
+    def test_ensure_status_column_reraises_unrelated_errors(self):
+        """A non-duplicate OperationalError (e.g. disk I/O) must propagate."""
+        class BrokenCursor:
+            def execute(self, sql, *args):
+                u = " ".join(sql.split()).upper()
+                if u.startswith("PRAGMA TABLE_INFO"):
+                    return []
+                if "ADD COLUMN STATUS" in u:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return []
+
+        with self.assertRaises(sqlite3.OperationalError):
+            media_automation._ensure_status_column(BrokenCursor())
+
+
 if __name__ == "__main__":
     unittest.main()
