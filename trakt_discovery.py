@@ -45,9 +45,15 @@ def get_int_env(key, default):
         return default
 
 def parse_env_list(key, default=""):
-    """Parse a comma-separated env var, stripping inline shell-style comments."""
+    """Parse a comma-separated env var, stripping inline shell-style comments.
+
+    A comment is only stripped when the '#' is preceded by whitespace (i.e. a
+    " #" sequence), matching shell inline-comment style. This keeps tokens that
+    legitimately contain '#' (e.g. "Some#Value") intact, while still dropping a
+    trailing "value  # comment".
+    """
     raw = os.getenv(key, default)
-    comment_pos = raw.find('#')
+    comment_pos = raw.find(' #')
     if comment_pos >= 0:
         raw = raw[:comment_pos]
     return [item.strip() for item in raw.split(",") if item.strip()]
