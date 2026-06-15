@@ -162,29 +162,29 @@ TMDB filters run at **step 8**, after rating, votes, year, genre, and content ra
    - **Permissions:** No special permissions needed (leave /checkin and /scrobble unchecked)
 2. Add your Client ID and Client Secret to `.env`
 3. Rebuild: `docker compose build && docker compose up -d`
-4. Authenticate: `docker exec media-automation python -u /app/trakt_discovery.py auth`
+4. Authenticate: `docker exec cascade-media python -u /app/trakt_discovery.py auth`
 5. Visit the URL displayed, enter the code
 6. Set `TRAKT_DISCOVERY_ENABLED=true` in `.env` and restart
 
 ### Commands
 ```bash
 # Authenticate with Trakt
-docker exec media-automation python -u /app/trakt_discovery.py auth
+docker exec cascade-media python -u /app/trakt_discovery.py auth
 
 # Check token and discovery stats
-docker exec media-automation python -u /app/trakt_discovery.py status
+docker exec cascade-media python -u /app/trakt_discovery.py status
 
 # Dry run (see what would be requested without making changes)
-docker exec -e DRY_RUN=true media-automation python -u /app/trakt_discovery.py discover
+docker exec -e DRY_RUN=true cascade-media python -u /app/trakt_discovery.py discover
 
 # Run discovery now
-docker exec media-automation python -u /app/trakt_discovery.py discover
+docker exec cascade-media python -u /app/trakt_discovery.py discover
 
 # Clear discovered items for a fresh start (keeps request log)
-docker exec media-automation python -u /app/trakt_discovery.py reset
+docker exec cascade-media python -u /app/trakt_discovery.py reset
 
 # Re-authenticate (clear tokens and start over)
-docker exec media-automation python -u /app/trakt_discovery.py reauth
+docker exec cascade-media python -u /app/trakt_discovery.py reauth
 ```
 
 ---
@@ -335,59 +335,59 @@ Run these from your server terminal:
 
 ### View Logs
 ```bash
-docker logs -f media-automation
+docker logs -f cascade-media
 ```
 
 ### List All Processed Series
 ```bash
-docker exec media-automation python /app/media_automation.py list
+docker exec cascade-media python /app/media_automation.py list
 ```
 Shows every series the script has processed, with Sonarr IDs and timestamps.
 
 ### Reprocess a Specific Series
 ```bash
-docker exec media-automation python /app/media_automation.py reprocess <sonarr_id>
+docker exec cascade-media python /app/media_automation.py reprocess <sonarr_id>
 ```
 Clears the series from the database and reprocesses it. Use this if monitoring got set wrong or you want to re-run the logic.
 
 **How to find the Sonarr ID:**
-1. **From the list command:** Run `docker exec media-automation python /app/media_automation.py list` to see all processed series with their IDs
+1. **From the list command:** Run `docker exec cascade-media python /app/media_automation.py list` to see all processed series with their IDs
 2. **From Sonarr UI:** Go to the series page in Sonarr and look at the URL - it will be `http://your-sonarr:8989/series/<series-name>`. Click on the series to open the detail page, then check the browser's address bar or network tab for the numeric ID
 3. **From Sonarr API:** Visit `http://your-sonarr:8989/api/v3/series?apikey=<your-api-key>` and search for your series in the JSON response - the `id` field is the Sonarr ID
 
 ### Manually Trigger a Full Run
 ```bash
-docker exec media-automation python /app/media_automation.py
+docker exec cascade-media python /app/media_automation.py
 ```
 Runs the full polling cycle immediately: checks for new series, checks watch progress, cleans up stale DB entries.
 
 ### Process a Single Series (Webhook Mode)
 ```bash
-docker exec media-automation python /app/media_automation.py webhook <sonarr_id>
+docker exec cascade-media python /app/media_automation.py webhook <sonarr_id>
 ```
 Processes a single series as if it just arrived via webhook. Queries Seerr for the requested season(s) and sets monitoring accordingly.
 
 ### Check Active Playback
 ```bash
-docker exec media-automation python /app/media_automation.py playback
+docker exec cascade-media python /app/media_automation.py playback
 ```
 Checks Jellyfin for active playback sessions and unlocks/prioritizes seasons if a user is watching a preview E01.
 
 ### Run Catch-up for Existing Series
 ```bash
-docker exec media-automation python /app/media_automation.py catchup
+docker exec cascade-media python /app/media_automation.py catchup
 ```
 One-time processing for series that were already in Sonarr before this script was installed. Respects seasons that already have downloaded files.
 
 ### Dry Run
 ```bash
-docker exec -e DRY_RUN=true media-automation python /app/media_automation.py
+docker exec -e DRY_RUN=true cascade-media python /app/media_automation.py
 ```
 Logs what changes would be made without actually modifying anything.
 
 ### Show Help
 ```bash
-docker exec media-automation python /app/media_automation.py help
+docker exec cascade-media python /app/media_automation.py help
 ```
 
 ## Update to Latest Version
@@ -400,7 +400,7 @@ Verify the new image is healthy:
 
 ```bash
 docker compose ps                            # wait for STATUS to show (healthy) — 30-60s
-docker logs media-automation --tail 20       # confirm no startup errors
+docker logs cascade-media --tail 20       # confirm no startup errors
 ```
 
 To pin to a specific version instead of `:latest`, edit the `image:` line in `docker-compose.yml`:
@@ -420,8 +420,8 @@ A built-in Docker `HEALTHCHECK` probes the webhook HTTP server on port 9191 ever
 
 ```bash
 docker compose ps                                                   # column "STATUS" shows (healthy)
-docker inspect media-automation --format '{{.State.Health.Status}}' # → "healthy"
-docker inspect media-automation --format '{{json .State.Health}}'   # full probe history
+docker inspect cascade-media --format '{{.State.Health.Status}}' # → "healthy"
+docker inspect cascade-media --format '{{json .State.Health}}'   # full probe history
 ```
 
 ### Non-root user
@@ -432,10 +432,10 @@ chown -R 99:100 /path/to/your/data/dir
 ```
 
 ### Log rotation
-Docker's `json-file` driver is configured in `docker-compose.yml` to cap logs at 10MB per file × 5 files (~50MB total). Rotation is automatic — `docker logs media-automation` always works regardless of how long the container has been running.
+Docker's `json-file` driver is configured in `docker-compose.yml` to cap logs at 10MB per file × 5 files (~50MB total). Rotation is automatic — `docker logs cascade-media` always works regardless of how long the container has been running.
 
 ### Graceful shutdown
-The scheduler handles SIGTERM and SIGINT cleanly. `docker stop media-automation` typically exits in ~1 second: the background loops wake from their sleeps, the webhook HTTP server is shut down, and the worker pool cancels pending tasks. `docker-compose.yml` sets `stop_grace_period: 30s` to give the scheduler room to drain in-flight subprocess work before Docker escalates to SIGKILL.
+The scheduler handles SIGTERM and SIGINT cleanly. `docker stop cascade-media` typically exits in ~1 second: the background loops wake from their sleeps, the webhook HTTP server is shut down, and the worker pool cancels pending tasks. `docker-compose.yml` sets `stop_grace_period: 30s` to give the scheduler room to drain in-flight subprocess work before Docker escalates to SIGKILL.
 
 ## How the Database Works
 
@@ -446,6 +446,22 @@ The script uses a SQLite database at `/data/media_automation.db` (persisted via 
 - **priority_boosts**: Which seasons have had their SABnzbd download priorities boosted (prevents re-boosting on every poll cycle)
 
 The database auto-cleans entries for series that no longer exist in Sonarr (e.g., deleted by JellySweep). You never need to manually edit the database under normal operation.
+
+### Where the data lives (and why renaming the container is safe)
+
+The SQLite database **and** the Trakt OAuth token live on the **host** data folder — the path you bind-mount to `/data` — not inside the container. In `docker-compose.yml` that mapping is `${DATA_DIR:-./data}:/data`; on Unraid the template default is `/mnt/user/appdata/cascade-media`. Because all persistent state is on the host, the container itself is disposable:
+
+- **Renaming the container is non-destructive.** The container was historically named `media-automation` and is now standardized on `cascade-media`. Renaming does **not** touch or orphan your data — just keep the **same** `/data` mapping when you recreate. The safe sequence is **stop → rm → recreate** with the identical volume mapping:
+
+  ```bash
+  docker stop cascade-media
+  docker rm cascade-media
+  docker compose up -d        # recreates as cascade-media, same ${DATA_DIR}:/data mapping
+  ```
+
+  Your DB and Trakt token persist across the rename — no re-authentication needed. (If you previously set `DATA_DIR`, keep it pointed at the same host folder.)
+
+- **Keep the data dir on a cache-backed path, not the FUSE share.** Point `DATA_DIR` at a pool/cache-backed location (e.g. `/mnt/cache/appdata/cascade-media`) rather than the Unraid FUSE user share (`/mnt/user/...`). SQLite uses WAL mode, and WAL's memory-mapped locking can be flaky on `shfs`/FUSE, which can surface as intermittent "database is locked" or readonly errors — exactly the kind of write failure that can lose a rotated Trakt token. A cache/pool path avoids the FUSE layer entirely.
 
 ## Troubleshooting
 
@@ -470,18 +486,18 @@ The database auto-cleans entries for series that no longer exist in Sonarr (e.g.
 **Watch progress not triggering next season**
 - Verify the user's Jellyfin ID is in `JELLYFIN_USER_IDS`.
 - Check that the watch threshold has been met (default 75%).
-- Run `docker exec media-automation python /app/media_automation.py` to trigger a manual check.
+- Run `docker exec cascade-media python /app/media_automation.py` to trigger a manual check.
 
 **Got a "Trakt token refresh FAILED" or "Database readonly" alert email**
-- Check DB ownership: `stat /mnt/user/appdata/media-automation/data/media_automation.db` — should be `uid=99 gid=100 mode=664`. If the container can't write to the DB, `save_tokens()` fails *after* Trakt has already rotated the refresh_token, locking you out until manual re-auth.
-- Fix permissions from the host: `docker exec --user root media-automation chown 99:users /data/media_automation.db && docker exec --user root media-automation chmod 664 /data/media_automation.db`
-- Re-authenticate (interactive, ~1 min): `docker exec media-automation python -u /app/trakt_discovery.py auth`. Visit the URL it prints (`https://trakt.tv/activate`), enter the 8-character code, approve. The script saves the new tokens automatically.
-- Confirm with `docker exec -e DRY_RUN=true media-automation python -u /app/trakt_discovery.py discover` — should show "Loaded N watched shows / N watched movies" with no readonly errors.
+- Check DB ownership: `stat /mnt/user/appdata/cascade-media/data/media_automation.db` — should be `uid=99 gid=100 mode=664`. If the container can't write to the DB, `save_tokens()` fails *after* Trakt has already rotated the refresh_token, locking you out until manual re-auth.
+- Fix permissions from the host: `docker exec --user root cascade-media chown 99:users /data/media_automation.db && docker exec --user root cascade-media chmod 664 /data/media_automation.db`
+- Re-authenticate (interactive, ~1 min): `docker exec cascade-media python -u /app/trakt_discovery.py auth`. Visit the URL it prints (`https://trakt.tv/activate`), enter the 8-character code, approve. The script saves the new tokens automatically.
+- Confirm with `docker exec -e DRY_RUN=true cascade-media python -u /app/trakt_discovery.py discover` — should show "Loaded N watched shows / N watched movies" with no readonly errors.
 **Container reports unhealthy** *(v1.2.0+)*
-- Read the probe history: `docker inspect media-automation --format '{{json .State.Health}}'`. Repeated non-zero `ExitCode` entries mean the webhook server is not responding on port 9191.
+- Read the probe history: `docker inspect cascade-media --format '{{json .State.Health}}'`. Repeated non-zero `ExitCode` entries mean the webhook server is not responding on port 9191.
 - Verify port 9191 isn't being claimed by another process on the host.
-- Check container logs: `docker logs media-automation --tail 50`. A wedged Trakt discovery loop or stalled subprocess will usually show up here.
-- Recover by restarting: `docker compose restart media-automation`.
+- Check container logs: `docker logs cascade-media --tail 50`. A wedged Trakt discovery loop or stalled subprocess will usually show up here.
+- Recover by restarting: `docker compose restart cascade-media`.
 
 **Permission denied errors on /data after upgrading to v1.2.0+**
 - The container now runs as UID 99 GID 100 (non-root). On Unraid this matches `/mnt/user/appdata` ownership by default — no action needed.

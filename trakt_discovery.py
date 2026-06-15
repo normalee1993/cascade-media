@@ -218,7 +218,15 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
             resp = method(url, headers=headers, timeout=30, **kwargs)
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
+                # Retry-After may be an integer (seconds) or an HTTP-date per
+                # RFC 7231. int() crashes on the date form, aborting the cycle,
+                # so fall back to the 60s default for anything non-numeric.
+                _raw_retry = resp.headers.get('Retry-After', 60)
+                try:
+                    retry_after = int(_raw_retry)
+                except (TypeError, ValueError):
+                    log.warning(f"Non-numeric Retry-After header '{_raw_retry}', using 60s")
+                    retry_after = 60
                 log.warning(f"Rate limited, waiting {retry_after}s before retry")
                 time.sleep(retry_after)
                 continue
@@ -327,7 +335,10 @@ def _send_alert_webhook(message, subject="Token refresh failure"):
             requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
             log.info("Alert webhook sent")
         except Exception as e:
-            log.warning(f"Alert webhook failed: {e}")
+            # The exception string can embed the full ALERT_WEBHOOK_URL, which
+            # for Discord/Slack includes a secret token. Log only the exception
+            # type so the token never lands in `docker logs`.
+            log.warning(f"Alert webhook failed: {type(e).__name__}")
     _send_alert_email(subject, message)
 
 
@@ -646,7 +657,7 @@ def refresh_access_token(conn, refresh_token):
             "refresh_failed_alert_fired",
             f"Trakt token refresh FAILED: {e}\n"
             "If the token is expired, re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth",
         )
         return None
 
@@ -666,7 +677,7 @@ def refresh_access_token(conn, refresh_token):
             f"Trakt refresh persistence FAILED: {e}\n"
             "Trakt rotated tokens server-side but local save failed (DB readonly?).\n"
             "Re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth",
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth",
             subject="Token persistence failure",
         )
         return None
@@ -687,7 +698,7 @@ def get_valid_token(conn):
     if not tokens:
         msg = (
             "Trakt tokens MISSING from database — discovery is halted. Re-authenticate with:\n"
-            "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+            "  docker exec cascade-media python -u /app/trakt_discovery.py auth"
         )
         log.error(msg)
         if not _token_cache.get("missing_alert_fired"):
@@ -720,7 +731,7 @@ def get_valid_token(conn):
         if now >= expires_at:
             msg = (
                 "Trakt token EXPIRED and refresh FAILED. Re-authenticate with:\n"
-                "  docker exec media-automation python -u /app/trakt_discovery.py auth"
+                "  docker exec cascade-media python -u /app/trakt_discovery.py auth"
             )
             log.error(msg)
             _send_alert_once("expired_alert_fired", msg)
@@ -1737,19 +1748,19 @@ def cmd_status(conn):
             print(f"Token: Valid ({days_left} days until expiry)")
             if days_left <= 1:
                 print(f"  !! DANGER: expires in {days_left} days — re-auth may be needed soon")
-                print(f"  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+                print(f"  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
             elif days_left <= 3:
                 print(f"  Warning: expires in {days_left} days (auto-refresh will trigger soon)")
         else:
             print("Token: EXPIRED — run 'auth' to re-authenticate")
-            print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+            print("  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
         row = conn.execute("SELECT created_at FROM trakt_tokens WHERE id = 1").fetchone()
         if row and row[0]:
             last_refreshed = row[0][:19].replace("T", " ") + " UTC"
             print(f"  Last refreshed: {last_refreshed}")
     else:
         print("Token: Not configured — run 'auth' to authenticate")
-        print("  Run: docker exec media-automation python -u /app/trakt_discovery.py auth")
+        print("  Run: docker exec cascade-media python -u /app/trakt_discovery.py auth")
 
     # Discovery stats
     row = conn.execute("SELECT COUNT(*) FROM trakt_discovered").fetchone()
