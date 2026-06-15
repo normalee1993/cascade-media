@@ -1312,5 +1312,55 @@ class MigrationConcurrencyTests(unittest.TestCase):
             media_automation._ensure_status_column(BrokenCursor())
 
 
+class TmdbKeyRedactionTests(unittest.TestCase):
+    """TMDB v3 key is passed as a ?api_key= query param, so a requests
+    exception (whose string carries the full request URL) would leak the
+    secret into `docker logs`. _api_request_with_retry must redact it while
+    still reporting the failure. (Guard for the 2026-06 key-leak audit.)"""
+
+    def test_api_key_redacted_from_request_exception_log(self):
+        secret = "SUPERSECRET"
+        leaky_url = (
+            "https://api.themoviedb.org/3/tv/1399?"
+            "api_key=" + secret + "&language=en-US"
+        )
+
+        def fake_get(url, headers=None, timeout=None, **kwargs):
+            # Mimic a real requests failure whose message embeds the full URL.
+            raise requests.exceptions.RequestException(
+                "HTTPSConnectionPool: Failed to establish a connection to "
+                + leaky_url
+            )
+
+        with self.assertLogs(trakt_discovery.log, level="ERROR") as cm:
+            with self.assertRaises(requests.exceptions.RequestException):
+                trakt_discovery._api_request_with_retry(
+                    fake_get, leaky_url, {}, max_retries=1
+                )
+
+        output = "\n".join(cm.output)
+        # Secret must never appear in any log line...
+        self.assertNotIn(secret, output)
+        # ...but the failure must still be reported, with the key masked.
+        self.assertIn("API request failed", output)
+        self.assertIn("REDACTED", output)
+
+    def test_redact_secrets_masks_key_variants(self):
+        self.assertEqual(
+            trakt_discovery._redact_secrets("x?api_key=abc123&y=1"),
+            "x?api_key=REDACTED&y=1",
+        )
+        # Case-insensitive + apikey spelling.
+        self.assertEqual(
+            trakt_discovery._redact_secrets("x?ApiKey=abc123"),
+            "x?ApiKey=REDACTED",
+        )
+        # No key present -> unchanged.
+        self.assertEqual(
+            trakt_discovery._redact_secrets("plain message"),
+            "plain message",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
