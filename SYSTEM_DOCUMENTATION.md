@@ -127,7 +127,7 @@ SCHEDULER (scheduler.py) orchestrates everything:
 |------|-------|---------|
 | `scheduler.py` | 319 | Orchestrator - scheduling, webhook server, concurrency |
 | `media_automation.py` | 1418 | TV show lifecycle - monitoring, unlocking, queue management |
-| `trakt_discovery.py` | 1284 | Content discovery - Trakt + TMDB + Seerr with 13-stage filter |
+| `trakt_discovery.py` | 1822 | Content discovery - Trakt + TMDB + Seerr with 13-stage filter + AI (Gemini) source |
 | `docker-compose.yml` | 18 | Docker Compose service definition |
 | `Dockerfile` | 12 | Container build (python:3.11-slim + requests + tzdata) |
 | `.env.example` | ~115 | Environment variable template |
@@ -294,7 +294,7 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 | `TRAKT_CLIENT_SECRET` | "" | OAuth client secret |
 | `TRAKT_DISCOVER_SHOWS` | true | Discover TV shows |
 | `TRAKT_DISCOVER_MOVIES` | true | Discover movies |
-| `TRAKT_LISTS` | recommended,watchlist,trending,popular,anticipated | Lists to process |
+| `TRAKT_LISTS` | recommended,watchlist,trending,popular,anticipated | Lists to process (also accepts `ai` — see AI Discovery below) |
 | `TRAKT_MIN_RATING` | 7.0 | Minimum rating |
 | `TRAKT_MIN_VOTES` | 100 | Minimum votes |
 | `TRAKT_YEARS` | "" | Year range: `2020-2026` |
@@ -341,6 +341,30 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 | `TRAKT_PREMIUM_BYPASS_LISTS` | recommended,watchlist | Eligible lists |
 | `TRAKT_PREMIUM_BYPASS_FILTERS` | year,status | Bypassable filters |
 
+#### AI Discovery (Gemini, v1.3.0)
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GEMINI_API_KEY` | "" | Enables the `ai` source (https://aistudio.google.com/apikey) |
+| `AI_MODEL` | gemini-flash-latest | Floating alias tracking Google's latest stable Flash model |
+| `AI_WEB_SEARCH` | true | Ground picks in live Google Search (grounded calls have a separate free-tier daily cap) |
+| `AI_HISTORY_ITEMS` | 50 | Watch-history items per type sent as taste profile |
+| `AI_SUGGESTIONS_MULTIPLIER` | 3 | Candidates per type = this × per-type request limit |
+| `AI_TIMEOUT_SECONDS` | 300 | Gemini call timeout; keep TRAKT_SCRIPT_TIMEOUT ≥ this + 120 |
+| `AI_MIN_RATING` | =TRAKT_MIN_RATING | AI-source-only rating floor |
+| `AI_MIN_VOTES` | =TRAKT_MIN_VOTES | AI-source-only vote floor |
+
+The prompt is fed `TMDB_DISALLOWED_NETWORKS` + `TMDB_DISALLOWED_PROVIDERS` so the
+model avoids titles exclusive to blocked platforms (the dominant cause of AI
+picks getting filtered to zero when a user blocks Netflix/Apple/Max/HBO).
+
+Flow: one Gemini call per cycle (covers shows + movies, cached in `_ai_cache`) →
+taste profile from `/users/me/watched/*` + Trakt/TMDB trending + DB exclusions →
+prompt-enforced JSON (grounding is incompatible with Gemini's JSON mode, parser
+is lenient) → two-pass Trakt `/search` resolution (year ±1, then year-relaxed) →
+resolved items enter the standard filter pipeline with `source="ai"`. Failures
+log + alert once per cycle (`_send_alert_once`) and fall through to the
+remaining lists. With `ai` in `TRAKT_LISTS` but no key: one warning, skipped.
+
 #### Other
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -364,6 +388,10 @@ Discover movies and TV shows from Trakt, filter through 13-stage pipeline, reque
 **Two-Pass** (TRAKT_CROSS_LIST_PRIORITY=true):
 - Pass 1: Items on BOTH source AND target lists (highest confidence)
 - Pass 2: Remaining items in list order
+
+The `ai` source participates in both modes like any other list (its fetch is
+cached, so the upfront two-pass fetch triggers only one Gemini call). Power
+users may add `ai` to `TRAKT_CROSS_LIST_SOURCES` or `TRAKT_PREMIUM_BYPASS_LISTS`.
 
 ### Seerr Request Behavior
 - TV Shows: Season 1 only (cascade handles rest)
@@ -499,6 +527,8 @@ title TEXT, source TEXT, requested_at TEXT
 | `/api/v3/command` | POST | Trigger searches |
 | `/api/v3/queue` | GET | Download queue |
 | `/api/v3/queue/{id}` | DELETE | Cancel download |
+
+> **Known limitation — "matched by ID" import blocks.** When a completed download's release name doesn't parse to a library title (e.g. `Battlestar.Galactica.2005.S02E01` vs `Battlestar Galactica (2003)`), Sonarr/Radarr can only match it via grab-history ID and refuses to auto-import as a safety measure (`importBlocked`/`importPending`, *"Automatic import is not possible / Manual Import required"*). There is no config toggle to force import-by-ID; today these require a manual import in Activity → Queue. Auto-resolving them from the scheduler (`GET /api/v3/manualimport?downloadId=` → `POST /api/v3/command {"name":"ManualImport"}`) is tracked in `project_backlog.md`.
 
 ### Jellyfin
 | Endpoint | Usage |

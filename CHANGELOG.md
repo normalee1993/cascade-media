@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.4.0] - 2026-06-11
+
+### Added
+- **AI prompt is now aware of your platform blocklist.** `build_ai_prompt` receives `TMDB_DISALLOWED_NETWORKS` + `TMDB_DISALLOWED_PROVIDERS` and instructs Gemini not to suggest titles exclusive to those platforms. In live testing this was the single biggest improvement: a config blocking Netflix/Apple TV/Max/HBO went from **0 requests** (every AI pick landed on a blocked platform) to a **fully-filled budget** of acclaimed, on-platform, taste-matched titles.
+- `AI_TIMEOUT_SECONDS` (default **300**, was a hardcoded 60) — configurable for slower/Pro models.
+- `AI_SUGGESTIONS_MULTIPLIER` (default **3**, was a hardcoded 2) — more candidates through the filters.
+- `AI_MIN_RATING` / `AI_MIN_VOTES` (default to the global `TRAKT_MIN_RATING` / `TRAKT_MIN_VOTES`) — optional AI-source-only floors so brand-new trending titles, which lag on Trakt vote counts, can pass without loosening the other lists.
+
+### Fixed
+- **AI title resolution now prefers an exact match.** `resolve_ai_suggestion` previously took the first Trakt result passing a loose startswith test, so *Sugar* resolved to the higher-ranked *Sugar Apple Fairy Tale*. It now scans for an exact normalized-title match first and only falls back to the prefix rule when none exists.
+
+### Notes
+- ⚠ A grounded call asking for more candidates can take ~70s+ (Pro models longer). `AI_TIMEOUT_SECONDS=300` now needs headroom under the scheduler: set `TRAKT_SCRIPT_TIMEOUT=600` (documented in `.env.example`), otherwise the run is killed mid-cycle.
+- SemVer: MINOR — new optional config + improvements; defaults preserve v1.3.0 behavior except the resolver fix (a strict improvement) and the blocklist-aware prompt (only active when you have disallowed networks/providers set).
+
+## [v1.3.0] - 2026-06-10
+
+### Added
+- **AI-powered discovery source (`"ai"`) for `trakt_discovery.py`.** Add `ai` to `TRAKT_LISTS` (typically first) and set `GEMINI_API_KEY` to have Google Gemini nominate ranked show/movie candidates each cycle. The model receives a taste profile built from your Trakt watch history (titles, years, genres, play counts), Trakt + TMDB trending lists, and — with `AI_WEB_SEARCH=true` — live Google Search grounding on what's currently popular across streaming platforms. Suggestions are resolved to real Trakt/TMDB IDs via a two-pass `/search` lookup (exact-year first, then year-relaxed) and then flow through the **existing filter pipeline unchanged** — rating, votes, year, genre, content-rating, TMDB, Seerr dedup, and watch-history checks all still apply; the AI only nominates candidates.
+- New env vars: `GEMINI_API_KEY`, `AI_MODEL` (default `gemini-flash-latest`, a floating alias that tracks Google's latest stable Flash model), `AI_WEB_SEARCH` (default true), `AI_HISTORY_ITEMS` (default 50).
+- New `trakt_search()` helper (public `/search/{type}` endpoint) and a lenient JSON parser for grounded model output (Gemini's JSON mode is incompatible with Google Search grounding, so the output contract is prompt-enforced).
+- 25 unit tests in `tests/test_ai_discovery.py` covering JSON parsing, title→ID resolution, per-cycle caching, request shape, and the failure path.
+
+### Notes
+- **Zero behavior change when unconfigured.** Without `ai` in `TRAKT_LISTS`, nothing differs from v1.2.4. With `ai` listed but no `GEMINI_API_KEY`, the source logs one warning and is skipped.
+- **Fail-loud fallback:** any Gemini failure (bad key, deprecated model, quota, network) logs an error, fires one alert per cycle through the existing webhook/email channels, and discovery falls through to the remaining `TRAKT_LISTS` sources.
+- One combined Gemini call per cycle covers both shows and movies (~1 call/day at default scheduling — well under typical free-tier limits; grounded calls have a separate daily free-tier cap).
+- A grounded Gemini call can take 10–30 s; raise `TRAKT_SCRIPT_TIMEOUT` if your cycle already runs near the 300 s default.
+- SemVer: MINOR bump — new backward-compatible functionality, no breaking changes.
+
 ## [v1.2.4] - 2026-05-25
 
 ### Reverted
@@ -119,6 +149,8 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.4.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.4.0
+[v1.3.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.3.0
 [v1.2.4]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.4
 [v1.2.3]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.3
 [v1.2.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.2

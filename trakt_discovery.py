@@ -124,6 +124,30 @@ TRAKT_PREMIUM_BYPASS_MIN_RATING = get_float_env("TRAKT_PREMIUM_BYPASS_MIN_RATING
 TRAKT_PREMIUM_BYPASS_LISTS = parse_env_list("TRAKT_PREMIUM_BYPASS_LISTS", "recommended,watchlist")
 TRAKT_PREMIUM_BYPASS_FILTERS = parse_env_list("TRAKT_PREMIUM_BYPASS_FILTERS", "year,status")
 
+# AI discovery (Gemini) — enabled by adding "ai" to TRAKT_LISTS + setting GEMINI_API_KEY.
+# The AI nominates candidates only; every existing filter still applies downstream.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "gemini-flash-latest")
+AI_WEB_SEARCH = os.getenv("AI_WEB_SEARCH", "true").lower() == "true"
+AI_HISTORY_ITEMS = get_int_env("AI_HISTORY_ITEMS", 50)
+# Single attempt, no retry. Grounded Flash calls take ~10-40s; a Pro model can
+# take longer, so this is configurable. IMPORTANT: keep TRAKT_SCRIPT_TIMEOUT
+# (scheduler, default 300s) comfortably above this value plus the rest of the
+# discovery cycle — recommend TRAKT_SCRIPT_TIMEOUT >= AI_TIMEOUT_SECONDS + 120.
+# Deliberately NOT routed through _api_request_with_retry (it hardcodes timeout=30).
+AI_TIMEOUT_SECONDS = get_int_env("AI_TIMEOUT_SECONDS", 300)
+# Ask for Nx the per-type request limit so resolution failures and filter
+# rejections don't leave the budget unfilled. Higher = more candidates = more
+# likely to fill the budget (at a few extra Trakt search calls each).
+AI_SUGGESTIONS_MULTIPLIER = get_int_env("AI_SUGGESTIONS_MULTIPLIER", 3)
+# AI-source-specific rating/vote floors. Default to the global thresholds, so
+# behavior is unchanged unless set. Relax these (e.g. AI_MIN_VOTES=20) to let
+# brand-new trending titles — which haven't accumulated Trakt votes yet — pass
+# for the "ai" source only, without loosening trending/popular/etc.
+AI_MIN_RATING = get_float_env("AI_MIN_RATING", TRAKT_MIN_RATING)
+AI_MIN_VOTES = get_int_env("AI_MIN_VOTES", TRAKT_MIN_VOTES)
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
 # Seerr
 SEERR_URL = os.getenv("SEERR_URL", "")
 SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
@@ -342,6 +366,12 @@ def seerr_post(endpoint, data):
 # ============================================================
 _tmdb_cache = {}
 _tmdb_providers_cache = {}
+
+# Per-cycle AI cache — one Gemini call serves both media types; failures are
+# cached as empty lists so a broken config alerts once per cycle, not per type.
+# Keys: "suggestions" ({"show": [...], "movie": [...]}), ("resolved", media_type),
+# "warned_unconfigured".
+_ai_cache = {}
 
 
 def tmdb_get(endpoint, params=None):
@@ -791,10 +821,344 @@ def poll_device_token(conn, device_code, interval, expires_in):
 
 
 # ============================================================
+# AI DISCOVERY (Gemini)
+# ============================================================
+def fetch_watch_history_summary(conn, media_type, limit):
+    """Compact taste profile from Trakt watch history for the AI prompt.
+    Returns [] on failure — degraded context is acceptable; total AI failure
+    is handled at the fetch_ai_list level."""
+    items = trakt_get(f"/users/me/watched/{media_type}s", params={"extended": "full"},
+                      auth_required=True, conn=conn)
+    if not isinstance(items, list):
+        log.warning(f"Could not fetch watch history for AI taste profile ({media_type}s)")
+        return []
+
+    items.sort(key=lambda i: i.get("last_watched_at") or "", reverse=True)
+    summary = []
+    for item in items[:limit]:
+        media = item.get(media_type, {})
+        if not media.get("title"):
+            continue
+        last_watched = (item.get("last_watched_at") or "")[:10]  # date only
+        summary.append({
+            "title": media["title"],
+            "year": media.get("year"),
+            "genres": [g.lower() for g in media.get("genres", [])][:3],
+            "plays": item.get("plays", 0),
+            "last_watched": last_watched,
+        })
+    return summary
+
+
+def fetch_ai_exclusions(conn, limit=300):
+    """Titles the AI must not re-suggest: already requested, in the library, or
+    watched. Filter-based skips are absent on purpose — they get re-filtered
+    anyway, and config changes may un-skip them."""
+    rows = conn.execute(
+        "SELECT title, media_type FROM trakt_discovered "
+        "WHERE action IN ('requested', 'skipped_exists', 'skipped_watched') "
+        "ORDER BY discovered_at DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    return [f"{title} ({media_type})" for title, media_type in rows]
+
+
+def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows, n_movies,
+                    blocked_platforms=None):
+    """Assemble the recommendation prompt. Pure function — unit-testable.
+    blocked_platforms: networks/providers the user filters out downstream — the
+    model is told to avoid titles exclusive to them so it doesn't waste slots."""
+    lines = []
+    asks = []
+    if n_shows:
+        asks.append(f"exactly {n_shows} TV shows")
+    if n_movies:
+        asks.append(f"exactly {n_movies} movies")
+    lines.append(
+        "You are a recommendation engine for a personal media server. "
+        f"Recommend {' and '.join(asks)} the user has not seen, ranked best-first."
+    )
+    lines.append(
+        "Heavily weigh what is currently trending and talked about across major "
+        "streaming platforms, balanced against the user's taste profile below."
+    )
+    if blocked_platforms:
+        blocked = ", ".join(blocked_platforms)
+        lines.append(
+            f"CRITICAL: The user CANNOT use these platforms: {blocked}. Do NOT "
+            f"suggest any title that streams exclusively on them — those picks are "
+            f"useless and will be discarded. Favor titles available on other "
+            f"services (e.g. Disney+, Hulu, Prime Video, Paramount+, Peacock) or "
+            f"on broadcast/cable, even if a {blocked.split(',')[0].strip()} title "
+            f"is more prominent this week."
+        )
+    if AI_WEB_SEARCH:
+        lines.append(
+            "Use Google Search to check what is trending and newly released "
+            "this week before deciding."
+        )
+
+    if history:
+        lines.append("\nRECENT WATCH HISTORY (taste profile, most recent first):")
+        for h in history:
+            genres = ",".join(h["genres"])
+            lines.append(f"- {h['title']} ({h['year']}) [{genres}] plays={h['plays']} last={h['last_watched']}")
+
+    if trakt_trending:
+        lines.append("\nTRAKT TRENDING NOW:")
+        lines.extend(f"- {t}" for t in trakt_trending)
+
+    if tmdb_trending:
+        lines.append("\nTMDB TRENDING THIS WEEK:")
+        lines.extend(f"- {t}" for t in tmdb_trending)
+
+    if exclusions:
+        lines.append("\nDO NOT suggest any of these (already watched, requested, or in the library):")
+        lines.extend(f"- {e}" for e in exclusions)
+    lines.append("Also never suggest anything already in the watch history above.")
+
+    hints = [f"Prefer titles rated {TRAKT_MIN_RATING}+ on Trakt with substantial vote counts."]
+    if TRAKT_LANGUAGES:
+        hints.append(f"Prefer content originally in: {TRAKT_LANGUAGES}.")
+    if TRAKT_YEARS:
+        hints.append(f"Prefer releases in the year range {TRAKT_YEARS}.")
+    lines.append("\n" + " ".join(hints))
+
+    lines.append(
+        "\nRespond with ONLY a JSON array — no markdown code fences, no commentary "
+        "before or after. Each element: {\"title\": str, \"year\": int (first air year "
+        "for shows, release year for movies), \"media_type\": \"show\" or \"movie\", "
+        "\"reason\": str (one short sentence)}."
+    )
+    return "\n".join(lines)
+
+
+def gemini_generate(prompt):
+    """Single-attempt Gemini REST call. Raises on any failure — the caller
+    alerts and falls through to the remaining TRAKT_LISTS sources.
+    The API key travels in a header only, never in the URL, so it cannot leak
+    into requests exception messages or logs."""
+    url = GEMINI_API_URL.format(model=AI_MODEL)
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    if AI_WEB_SEARCH:
+        body["tools"] = [{"google_search": {}}]
+
+    resp = requests.post(url, headers=headers, json=body, timeout=AI_TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    data = resp.json()
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise ValueError(f"Gemini returned no candidates (promptFeedback: {data.get('promptFeedback')})")
+    # Grounded responses commonly split the answer across multiple parts
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts)
+    if not text.strip():
+        raise ValueError(f"Gemini returned empty text (finishReason: {candidates[0].get('finishReason')})")
+    return text
+
+
+def parse_ai_suggestions(text):
+    """Lenient parser for model output. Returns [] on failure — never raises.
+    Grounding is incompatible with Gemini's JSON mode, so the JSON contract is
+    prompt-enforced and the model may wrap it in fences or prose."""
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        log.error(f"AI response contained no JSON array: {text[:200]!r}")
+        return []
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        log.error(f"AI response JSON parse failed ({e}): {text[:200]!r}")
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    type_map = {"show": "show", "tv": "show", "series": "show", "movie": "movie", "film": "movie"}
+    suggestions = []
+    for entry in parsed:
+        if not isinstance(entry, dict) or not str(entry.get("title") or "").strip():
+            log.debug(f"Dropping AI suggestion without title: {entry!r}")
+            continue
+        media_type = type_map.get(str(entry.get("media_type", "")).strip().lower())
+        if not media_type:
+            log.debug(f"Dropping AI suggestion with unknown media_type: {entry!r}")
+            continue
+        try:
+            year = int(entry.get("year"))
+        except (TypeError, ValueError):
+            year = None
+        suggestions.append({
+            "title": str(entry["title"]).strip(),
+            "year": year,
+            "media_type": media_type,
+            "reason": str(entry.get("reason", ""))[:200],
+        })
+    return suggestions
+
+
+def trakt_search(media_type, title, years=None):
+    """Search Trakt for a title. Public endpoint, no auth required."""
+    params = {"query": title, "extended": "full"}
+    if years:
+        params["years"] = years
+    results = trakt_get(f"/search/{media_type}", params=params)
+    return results if isinstance(results, list) else []
+
+
+def _normalize_title(title):
+    """Normalize for matching: lowercase, drop leading 'the ', strip non-alphanumerics."""
+    norm = title.lower().strip()
+    if norm.startswith("the "):
+        norm = norm[4:]
+    return "".join(c for c in norm if c.isalnum() or c == " ").strip()
+
+
+def resolve_ai_suggestion(suggestion):
+    """Resolve an AI suggestion to a real Trakt item via search.
+    Returns the raw search wrapper ({"type": ..., "show"/"movie": {...}}) which is
+    already the shape extract_item_info handles — or None if unresolvable.
+    Pass 1 constrains by year (±1); pass 2 retries without the year filter to
+    cover first-air-year vs current-season-year drift."""
+    title = suggestion["title"]
+    year = suggestion.get("year")
+    media_type = suggestion["media_type"]
+    norm_wanted = _normalize_title(title)
+
+    def find_match(results, check_year):
+        # Two-tier: prefer an EXACT normalized-title match anywhere in the
+        # results before falling back to the looser startswith rule. Without
+        # this, "Sugar" matched "Sugar Apple Fairy Tale" because the latter
+        # ranked higher on Trakt and passed the prefix test first.
+        fallback = None
+        for result in results:  # Trakt orders by relevance
+            media = result.get(media_type)
+            if not media or not media.get("title"):
+                continue
+            if check_year and year and media.get("year") and abs(media["year"] - year) > 1:
+                continue
+            norm_got = _normalize_title(media["title"])
+            if norm_got == norm_wanted:
+                return result  # exact match wins outright
+            # Bidirectional startswith catches "The Office (US)" vs "The Office".
+            # Remember the first such near-match but keep scanning for an exact one.
+            if fallback is None and (norm_got.startswith(norm_wanted)
+                                     or norm_wanted.startswith(norm_got)):
+                fallback = result
+        return fallback
+
+    years_param = f"{year - 1}-{year + 1}" if year else None
+    match = find_match(trakt_search(media_type, title, years=years_param), check_year=True)
+    if not match and year:
+        match = find_match(trakt_search(media_type, title), check_year=False)
+
+    if not match:
+        log.debug(f"AI suggestion unresolvable on Trakt: '{title}' ({year}) [{media_type}]")
+    return match
+
+
+def _trending_titles_for_prompt(conn, media_type):
+    """Title/year lines from Trakt trending for AI context."""
+    titles = []
+    for item in fetch_list(conn, "trending", media_type):
+        info = extract_item_info(item, media_type, "trending")
+        if info:
+            titles.append(f"{info['title']} ({info['year']}) [{media_type}]")
+    return titles
+
+
+def _tmdb_trending_titles():
+    """Title/year lines from TMDB weekly trending. Empty if no TMDB key."""
+    titles = []
+    for tmdb_type, label in (("tv", "show"), ("movie", "movie")):
+        data = tmdb_get(f"/trending/{tmdb_type}/week")
+        if not data:
+            continue
+        for entry in data.get("results", [])[:20]:
+            name = entry.get("name") or entry.get("title")
+            date = entry.get("first_air_date") or entry.get("release_date") or ""
+            if name:
+                titles.append(f"{name} ({date[:4]}) [{label}]")
+    return titles
+
+
+def fetch_ai_list(conn, media_type):
+    """AI discovery orchestrator. One Gemini call per cycle covers both media
+    types; resolution to Trakt items happens lazily per type. Any failure
+    returns [] so discovery falls through to the remaining TRAKT_LISTS sources."""
+    if not GEMINI_API_KEY:
+        if not _ai_cache.get("warned_unconfigured"):
+            log.warning("'ai' is in TRAKT_LISTS but GEMINI_API_KEY is not set — skipping AI source")
+            _ai_cache["warned_unconfigured"] = True
+        return []
+
+    resolved_key = ("resolved", media_type)
+    if resolved_key in _ai_cache:
+        return _ai_cache[resolved_key]
+
+    if "suggestions" not in _ai_cache:
+        enabled_types = [mt for mt, flag in (("show", TRAKT_DISCOVER_SHOWS),
+                                             ("movie", TRAKT_DISCOVER_MOVIES)) if flag]
+        try:
+            limits = _per_type_limits(enabled_types)
+            n_shows = AI_SUGGESTIONS_MULTIPLIER * limits["show"]
+            n_movies = AI_SUGGESTIONS_MULTIPLIER * limits["movie"]
+
+            history = []
+            trakt_trending = []
+            for mt in enabled_types:
+                history.extend(fetch_watch_history_summary(conn, mt, AI_HISTORY_ITEMS))
+                trakt_trending.extend(_trending_titles_for_prompt(conn, mt))
+
+            # Tell the model which platforms the user filters out so it doesn't
+            # spend suggestions on titles that will be rejected downstream.
+            blocked_platforms = list(dict.fromkeys(
+                TMDB_DISALLOWED_NETWORKS + TMDB_DISALLOWED_PROVIDERS))
+            prompt = build_ai_prompt(
+                history, trakt_trending, _tmdb_trending_titles(),
+                fetch_ai_exclusions(conn), n_shows, n_movies,
+                blocked_platforms=blocked_platforms,
+            )
+            log.info(f"Querying {AI_MODEL} for AI recommendations "
+                     f"(web search: {AI_WEB_SEARCH}, asking for {n_shows} shows / {n_movies} movies)")
+            suggestions = parse_ai_suggestions(gemini_generate(prompt))
+            split = {"show": [], "movie": []}
+            for s in suggestions:
+                split[s["media_type"]].append(s)
+            _ai_cache["suggestions"] = split
+            log.info(f"AI suggested {len(suggestions)} titles "
+                     f"({len(split['show'])} shows, {len(split['movie'])} movies)")
+        except Exception as e:
+            log.error(f"AI discovery failed: {e}")
+            _send_alert_once(
+                "ai_failure_alert_fired",
+                f"AI discovery (Gemini) failed: {e}\n"
+                "Discovery continues with the remaining TRAKT_LISTS sources.",
+                subject="AI discovery failure",
+            )
+            # Cache the failure so the other media type doesn't retry this cycle
+            _ai_cache["suggestions"] = {"show": [], "movie": []}
+
+    resolved = []
+    for suggestion in _ai_cache["suggestions"][media_type]:
+        item = resolve_ai_suggestion(suggestion)
+        if item is not None:
+            resolved.append(item)
+    _ai_cache[resolved_key] = resolved
+    return resolved
+
+
+# ============================================================
 # DISCOVERY LOGIC
 # ============================================================
 def fetch_list(conn, list_type, media_type):
     """Fetch a Trakt list. Returns list of items with extended info."""
+    if list_type == "ai":
+        return fetch_ai_list(conn, media_type)
+
     # Build endpoint
     # 'recommended' and 'watchlist' require auth
     auth_required = list_type in ("recommended", "watchlist")
@@ -1033,15 +1397,21 @@ def process_discovered_item(conn, item, media_type, source, request_count, max_r
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_watched", rating)
         return request_count
 
+    # Rating/vote floors. The "ai" source uses its own (by default identical)
+    # thresholds so brand-new trending titles, which lag on Trakt vote counts,
+    # can be let through for AI picks without loosening the other lists.
+    min_rating = AI_MIN_RATING if source == "ai" else TRAKT_MIN_RATING
+    min_votes = AI_MIN_VOTES if source == "ai" else TRAKT_MIN_VOTES
+
     # Skip if below rating threshold
-    if rating and rating < TRAKT_MIN_RATING:
-        log.debug(f"Skipping '{title}' — rating {rating:.1f} < {TRAKT_MIN_RATING}")
+    if rating and rating < min_rating:
+        log.debug(f"Skipping '{title}' — rating {rating:.1f} < {min_rating}")
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_rating", rating)
         return request_count
 
     # Skip if below vote threshold
-    if votes and votes < TRAKT_MIN_VOTES:
-        log.debug(f"Skipping '{title}' — {votes} votes < {TRAKT_MIN_VOTES}")
+    if votes and votes < min_votes:
+        log.debug(f"Skipping '{title}' — {votes} votes < {min_votes}")
         record_discovered(conn, media_type, trakt_id, tmdb_id, title, source, "skipped_votes", rating)
         return request_count
 
@@ -1283,6 +1653,27 @@ def _discover_two_pass(conn, media_types, type_limits, type_counts, watched_ids)
                     processed_ids.add((media_type, tid))
 
 
+def _per_type_limits(media_types):
+    """Per-type request limits for a cycle. Shared by discover_content and
+    fetch_ai_list (which sizes its suggestion ask from these limits)."""
+    if TRAKT_MAX_SHOW_REQUESTS or TRAKT_MAX_MOVIE_REQUESTS:
+        max_show = TRAKT_MAX_SHOW_REQUESTS if TRAKT_MAX_SHOW_REQUESTS else TRAKT_MAX_REQUESTS_PER_CYCLE
+        max_movie = TRAKT_MAX_MOVIE_REQUESTS if TRAKT_MAX_MOVIE_REQUESTS else TRAKT_MAX_REQUESTS_PER_CYCLE
+    else:
+        # Split evenly (backward compatible)
+        enabled_count = len(media_types)
+        per_type = TRAKT_MAX_REQUESTS_PER_CYCLE // enabled_count if enabled_count else 0
+        max_show = per_type if "show" in media_types else 0
+        max_movie = per_type if "movie" in media_types else 0
+
+    if "show" not in media_types:
+        max_show = 0
+    if "movie" not in media_types:
+        max_movie = 0
+
+    return {"show": max_show, "movie": max_movie}
+
+
 def discover_content(conn):
     """Main discovery orchestrator. Loops through configured lists and media types."""
     if not TRAKT_CLIENT_ID:
@@ -1303,26 +1694,10 @@ def discover_content(conn):
         log.warning("Neither shows nor movies enabled for discovery")
         return
 
-    # Calculate per-type limits
-    if TRAKT_MAX_SHOW_REQUESTS or TRAKT_MAX_MOVIE_REQUESTS:
-        max_show = TRAKT_MAX_SHOW_REQUESTS if TRAKT_MAX_SHOW_REQUESTS else TRAKT_MAX_REQUESTS_PER_CYCLE
-        max_movie = TRAKT_MAX_MOVIE_REQUESTS if TRAKT_MAX_MOVIE_REQUESTS else TRAKT_MAX_REQUESTS_PER_CYCLE
-    else:
-        # Split evenly (backward compatible)
-        enabled_count = len(media_types)
-        per_type = TRAKT_MAX_REQUESTS_PER_CYCLE // enabled_count if enabled_count else 0
-        max_show = per_type if "show" in media_types else 0
-        max_movie = per_type if "movie" in media_types else 0
-
-    if "show" not in media_types:
-        max_show = 0
-    if "movie" not in media_types:
-        max_movie = 0
-
-    type_limits = {"show": max_show, "movie": max_movie}
+    type_limits = _per_type_limits(media_types)
     type_counts = {"show": 0, "movie": 0}
 
-    log.info(f"Starting Trakt discovery cycle (lists: {TRAKT_LISTS}, types: {media_types}, limits: shows={max_show}, movies={max_movie})")
+    log.info(f"Starting Trakt discovery cycle (lists: {TRAKT_LISTS}, types: {media_types}, limits: shows={type_limits['show']}, movies={type_limits['movie']})")
     if DRY_RUN:
         log.info("[DRY RUN] No actual requests will be made")
 
@@ -1330,6 +1705,7 @@ def discover_content(conn):
     _tmdb_cache.clear()
     _tmdb_providers_cache.clear()
     _token_cache.clear()
+    _ai_cache.clear()
 
     # Fetch watch history to skip already-watched content
     watched_ids = fetch_watched_ids(conn)
