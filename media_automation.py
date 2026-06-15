@@ -992,6 +992,27 @@ def cleanup_unwanted_queue_items(series_id, title):
     return cancelled
 
 
+def _index_series_by_tvdb(series_by_tvdb, s):
+    """Insert a Sonarr series into a tvdbId->series map, keeping the first on collision.
+
+    Two Sonarr entries sharing a tvdbId would otherwise silently overwrite each
+    other. We keep the first-seen entry and warn naming both series so the
+    duplicate is visible in logs.
+    """
+    tvdb_id = s.get("tvdbId")
+    if not tvdb_id:
+        return
+    existing = series_by_tvdb.get(tvdb_id)
+    if existing is not None:
+        log.warning(
+            f"Duplicate tvdbId {tvdb_id} in Sonarr: keeping "
+            f"'{existing.get('title')}' (id={existing.get('id')}), "
+            f"skipping '{s.get('title')}' (id={s.get('id')})"
+        )
+        return
+    series_by_tvdb[tvdb_id] = s
+
+
 # ============================================================
 # TASK 2: Monitor watch progress and unlock next seasons
 # ============================================================
@@ -1017,8 +1038,7 @@ def check_watch_progress(conn):
             else:
                 series_by_title[title_lower] = [existing, s]
 
-        if s.get("tvdbId"):
-            series_by_tvdb[s["tvdbId"]] = s
+        _index_series_by_tvdb(series_by_tvdb, s)
 
     for user_id in JELLYFIN_USER_IDS:
         check_user_progress(conn, user_id, series_by_title, series_by_tvdb, all_series)
@@ -1444,8 +1464,7 @@ def check_active_playback(conn):
             title_lower = s["title"].lower().strip()
             if title_lower not in series_by_title:
                 series_by_title[title_lower] = s
-            if s.get("tvdbId"):
-                series_by_tvdb[s["tvdbId"]] = s
+            _index_series_by_tvdb(series_by_tvdb, s)
     except Exception as e:
         log.warning(f"Failed to fetch Sonarr series for playback check: {e}")
         return  # Can't proceed without series data
