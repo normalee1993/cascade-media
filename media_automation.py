@@ -317,6 +317,28 @@ def get_requested_seasons_from_seerr(tvdb_id, title):
 # ============================================================
 # DATABASE (tracks processed series and season unlocks)
 # ============================================================
+def _ensure_status_column(c):
+    """Add processed_series.status if missing — idempotent AND safe under concurrent init_db.
+
+    The scheduler launches the poll and playback subprocesses at the same instant and
+    each calls init_db on the same database. Both can read PRAGMA table_info (seeing no
+    `status` column) before either runs the ALTER, then serialize on the write — so the
+    loser's `ALTER TABLE ... ADD COLUMN` raises "duplicate column name: status". That
+    collision is benign (the column exists either way), so swallow it; re-raise anything
+    else. Rows predating the column are backfilled to 'done' — they were fully set up
+    under the old model and must never be re-processed. (Prod incident 2026-06-15.)
+    """
+    existing_cols = {row[1] for row in c.execute("PRAGMA table_info(processed_series)")}
+    if "status" in existing_cols:
+        return
+    try:
+        c.execute("ALTER TABLE processed_series ADD COLUMN status TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+    c.execute("UPDATE processed_series SET status = 'done' WHERE status IS NULL")
+
+
 def init_db():
     """Initialize SQLite database for tracking."""
     db_dir = os.path.dirname(DB_PATH)
@@ -346,16 +368,9 @@ def init_db():
                 )
             """)
             # Idempotent migration for EXISTING populated DBs created before the
-            # status column existed. ALTER TABLE ADD COLUMN errors if the column
-            # is already present, so guard it with PRAGMA table_info. Any rows
-            # that predate this column represent series that were already fully
-            # set up under the old "mark processed at start" model, so they are
-            # backfilled to 'done' (both via the column DEFAULT and an explicit
-            # UPDATE for NULLs) and will be skipped, never re-processed.
-            existing_cols = {row[1] for row in c.execute("PRAGMA table_info(processed_series)")}
-            if "status" not in existing_cols:
-                c.execute("ALTER TABLE processed_series ADD COLUMN status TEXT")
-                c.execute("UPDATE processed_series SET status = 'done' WHERE status IS NULL")
+            # status column existed. Safe under concurrent init_db (the poll and
+            # playback subprocesses race it at startup) — see _ensure_status_column.
+            _ensure_status_column(c)
             # ---- end processed_series schema + status migration ------------------
             c.execute("""
                 CREATE TABLE IF NOT EXISTS unlocked_seasons (
