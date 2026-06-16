@@ -1,9 +1,4 @@
-# RECOMMENDED: pin this base image by digest for reproducible, tamper-evident
-# builds, e.g. FROM python:3.11-slim@sha256:<digest>. Left as a floating tag
-# here because a real current digest could not be verified offline — do not
-# substitute an unverified digest. Resolve one on a connected host with:
-#   docker pull python:3.11-slim && docker inspect --format '{{index .RepoDigests 0}}' python:3.11-slim
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca  # python:3.11-slim
 
 WORKDIR /app
 

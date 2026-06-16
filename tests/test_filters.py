@@ -1312,5 +1312,103 @@ class MigrationConcurrencyTests(unittest.TestCase):
             media_automation._ensure_status_column(BrokenCursor())
 
 
+class TmdbKeyRedactionTests(unittest.TestCase):
+    """TMDB v3 key is passed as a ?api_key= query param, so a requests
+    exception (whose string carries the full request URL) would leak the
+    secret into `docker logs`. _api_request_with_retry must redact it while
+    still reporting the failure. (Guard for the 2026-06 key-leak audit.)"""
+
+    def test_api_key_redacted_from_request_exception_log(self):
+        secret = "SUPERSECRET"
+        leaky_url = (
+            "https://api.themoviedb.org/3/tv/1399?"
+            "api_key=" + secret + "&language=en-US"
+        )
+
+        def fake_get(url, headers=None, timeout=None, **kwargs):
+            # Mimic a real requests failure whose message embeds the full URL.
+            raise requests.exceptions.RequestException(
+                "HTTPSConnectionPool: Failed to establish a connection to "
+                + leaky_url
+            )
+
+        with self.assertLogs(trakt_discovery.log, level="ERROR") as cm:
+            with self.assertRaises(requests.exceptions.RequestException):
+                trakt_discovery._api_request_with_retry(
+                    fake_get, leaky_url, {}, max_retries=1
+                )
+
+        output = "\n".join(cm.output)
+        # Secret must never appear in any log line...
+        self.assertNotIn(secret, output)
+        # ...but the failure must still be reported, with the key masked.
+        self.assertIn("API request failed", output)
+        self.assertIn("REDACTED", output)
+
+    def test_redact_secrets_masks_key_variants(self):
+        self.assertEqual(
+            trakt_discovery._redact_secrets("x?api_key=abc123&y=1"),
+            "x?api_key=REDACTED&y=1",
+        )
+        # Case-insensitive + apikey spelling.
+        self.assertEqual(
+            trakt_discovery._redact_secrets("x?ApiKey=abc123"),
+            "x?ApiKey=REDACTED",
+        )
+        # No key present -> unchanged.
+        self.assertEqual(
+            trakt_discovery._redact_secrets("plain message"),
+            "plain message",
+        )
+class TvdbCollisionTests(unittest.TestCase):
+    """P3: two Sonarr series sharing a tvdbId silently overwrote each other in
+    the tvdbId->series map. The build must keep the first-seen entry and warn
+    naming both series so the duplicate is visible."""
+
+    def test_helper_keeps_first_and_warns_on_collision(self):
+        first = {"id": 10, "title": "Show A", "tvdbId": 555}
+        second = {"id": 20, "title": "Show B", "tvdbId": 555}
+        series_by_tvdb = {}
+        with self.assertLogs(media_automation.log, level="WARNING") as cm:
+            media_automation._index_series_by_tvdb(series_by_tvdb, first)
+            media_automation._index_series_by_tvdb(series_by_tvdb, second)
+        # First wins, second is skipped.
+        self.assertIs(series_by_tvdb[555], first)
+        # Warning names both series (id + title).
+        logged = "\n".join(cm.output)
+        self.assertIn("555", logged)
+        self.assertIn("Show A", logged)
+        self.assertIn("Show B", logged)
+
+    def test_check_watch_progress_keeps_first_same_tvdbid_series(self):
+        first = {"id": 10, "title": "Show A", "tvdbId": 555}
+        second = {"id": 20, "title": "Show B", "tvdbId": 555}
+        captured = {}
+
+        def capture_progress(conn, user_id, series_by_title, series_by_tvdb, all_series):
+            captured["map"] = series_by_tvdb
+
+        with patch.object(media_automation, "sonarr_get", return_value=[first, second]), \
+             patch.object(media_automation, "JELLYFIN_USER_IDS", ["u1"]), \
+             patch.object(media_automation, "check_user_progress", side_effect=capture_progress), \
+             self.assertLogs(media_automation.log, level="WARNING") as cm:
+            media_automation.check_watch_progress(conn=MagicMock())
+
+        # The FIRST series is the one retained under the shared tvdbId.
+        self.assertIs(captured["map"][555], first)
+        self.assertTrue(any("555" in line for line in cm.output))
+
+
+class ParseEnvListCommentTests(unittest.TestCase):
+    """P3: parse_env_list stripped from the first '#', truncating tokens that
+    legitimately contain '#'. Only a ' #' (space-preceded) sequence is a comment."""
+
+    def test_hash_in_token_survives_but_spaced_comment_stripped(self):
+        # 'Some#Value' keeps its '#'; the trailing ' # comment' is stripped.
+        with patch.dict(os.environ, {"X_LIST": "Some#Value, Other  # trailing comment"}):
+            result = trakt_discovery.parse_env_list("X_LIST")
+        self.assertEqual(result, ["Some#Value", "Other"])
+
+
 if __name__ == "__main__":
     unittest.main()
