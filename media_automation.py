@@ -105,11 +105,43 @@ def _parse_retry_after(headers, default=60):
         return default
 
 
-def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
-    """Make API request with retry logic for transient failures."""
+def _session_equivalent(method, session):
+    """Map a module-level requests.<verb> callable to the same verb bound to a Session.
+
+    The public helpers pass requests.get/post/put/delete as `method`. When the
+    in-process playback loop supplies its own thread-confined Session, we want the
+    request to go through session.get/post/... (keep-alive reuse) instead of the
+    module-level function. We resolve the verb by identity against the known
+    requests functions; anything we don't recognise (e.g. a test MagicMock) is
+    returned unchanged so behavior is preserved.
+    """
+    if session is None:
+        return method
+    verb = {
+        requests.get: "get",
+        requests.post: "post",
+        requests.put: "put",
+        requests.delete: "delete",
+    }.get(method)
+    if verb is None:
+        return method
+    return getattr(session, verb)
+
+
+def _api_request_with_retry(method, url, headers, max_retries=3, session=None, **kwargs):
+    """Make API request with retry logic for transient failures.
+
+    When a `session` (requests.Session) is supplied, the call is routed through
+    that session's bound verb (keep-alive connection reuse) instead of the
+    module-level requests function. The session is owned by ONE caller thread
+    (the in-process playback loop). When session is None this is a no-op and the
+    original module-level `requests` callable is used, preserving behavior for
+    every other (subprocess) entrypoint.
+    """
+    http_call = _session_equivalent(method, session)
     for attempt in range(max_retries):
         try:
-            resp = method(url, headers=headers, timeout=30, **kwargs)
+            resp = http_call(url, headers=headers, timeout=30, **kwargs)
 
             # Handle rate limiting
             if resp.status_code == 429:
@@ -155,19 +187,19 @@ def _api_request_with_retry(method, url, headers, max_retries=3, **kwargs):
     return None
 
 
-def sonarr_get(endpoint):
+def sonarr_get(endpoint, session=None):
     """GET request to Sonarr API."""
-    return _api_request_with_retry(requests.get, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS)
+    return _api_request_with_retry(requests.get, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, session=session)
 
 
-def sonarr_put(endpoint, data):
+def sonarr_put(endpoint, data, session=None):
     """PUT request to Sonarr API."""
-    return _api_request_with_retry(requests.put, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, json=data)
+    return _api_request_with_retry(requests.put, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, session=session, json=data)
 
 
-def sonarr_post(endpoint, data):
+def sonarr_post(endpoint, data, session=None):
     """POST request to Sonarr API."""
-    return _api_request_with_retry(requests.post, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, json=data)
+    return _api_request_with_retry(requests.post, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, session=session, json=data)
 
 
 def sonarr_delete(endpoint):
@@ -187,9 +219,9 @@ def sonarr_delete(endpoint):
     return None
 
 
-def jellyfin_get(endpoint, params=None):
+def jellyfin_get(endpoint, params=None, session=None):
     """GET request to Jellyfin API."""
-    return _api_request_with_retry(requests.get, f"{JELLYFIN_URL}{endpoint}", JELLYFIN_HEADERS, params=params)
+    return _api_request_with_retry(requests.get, f"{JELLYFIN_URL}{endpoint}", JELLYFIN_HEADERS, session=session, params=params)
 
 
 def seerr_get(endpoint, params=None):
@@ -200,8 +232,13 @@ def seerr_get(endpoint, params=None):
 # ============================================================
 # SABNZBD API HELPERS
 # ============================================================
-def sabnzbd_api(mode, params=None):
-    """Generic SABnzbd API call."""
+def sabnzbd_api(mode, params=None, session=None):
+    """Generic SABnzbd API call.
+
+    When `session` is supplied (the in-process playback loop's thread-confined
+    requests.Session) the GET reuses that session's keep-alive connection; else
+    it falls back to the module-level requests.get (subprocess back-compat).
+    """
     if not SABNZBD_API_KEY:
         log.warning("SABNZBD_API_KEY not set, skipping SABnzbd call")
         return None
@@ -211,8 +248,9 @@ def sabnzbd_api(mode, params=None):
     if params:
         req_params.update(params)
 
+    getter = session.get if session is not None else requests.get
     try:
-        resp = requests.get(url, params=req_params, timeout=30)
+        resp = getter(url, params=req_params, timeout=30)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -224,19 +262,19 @@ def sabnzbd_api(mode, params=None):
         return None
 
 
-def sabnzbd_get_queue():
+def sabnzbd_get_queue(session=None):
     """Get current SABnzbd queue slots."""
-    data = sabnzbd_api("queue")
+    data = sabnzbd_api("queue", session=session)
     if data and "queue" in data:
         return data["queue"].get("slots", [])
     return []
 
 
-def sabnzbd_set_priority(nzo_id, priority):
+def sabnzbd_set_priority(nzo_id, priority, session=None):
     """Set priority for a SABnzbd queue item.
     Priority codes: -1=low, 0=normal, 1=high, 2=force
     """
-    result = sabnzbd_api("queue", {"name": "priority", "value": nzo_id, "value2": str(priority)})
+    result = sabnzbd_api("queue", {"name": "priority", "value": nzo_id, "value2": str(priority)}, session=session)
     return result is not None
 
 
@@ -1308,13 +1346,20 @@ def mark_season_boosted(conn, sonarr_id, season_number):
         pass
 
 
-def boost_season_priority(conn, series_id, season_number, title, force_e02=False, max_retries=3):
+def boost_season_priority(conn, series_id, season_number, title, force_e02=False, max_retries=3,
+                          session=None, stop_event=None):
     """Boost SABnzbd download priority for a season's queued episodes.
 
     Args:
         force_e02: If True, set E02 to Force (2) and E03+ to High (1).
                    If False, set all episodes to High (1).
         max_retries: Number of attempts to find downloads in SABnzbd queue (default: 3)
+        session: Optional thread-confined requests.Session for the in-process
+                 playback loop; threaded into every Sonarr/SABnzbd call.
+        stop_event: Optional threading.Event. When set (scheduler shutdown), the
+                 retry-backoff waits return immediately so the loop can exit
+                 promptly. None preserves the blocking time.sleep behavior for the
+                 standalone `playback` CLI.
     """
     if not SABNZBD_API_KEY:
         log.info(f"  SABnzbd not configured, skipping priority boost for {title} S{season_number:02d}")
@@ -1326,7 +1371,7 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
 
     # Get episode info to map episode IDs to episode numbers
     try:
-        episodes = sonarr_get(f"/episode?seriesId={series_id}")
+        episodes = sonarr_get(f"/episode?seriesId={series_id}", session=session)
     except Exception as e:
         log.warning(f"  Failed to get episodes for priority boost: {e}")
         return
@@ -1349,13 +1394,21 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
         if attempt > 0:
             wait_time = wait_intervals[min(attempt, len(wait_intervals) - 1)]
             log.info(f"  Attempt {attempt + 1}/{max_retries}: Waiting {wait_time}s before checking SABnzbd queue...")
-            time.sleep(wait_time)
+            # Interruptible backoff: under the scheduler's in-process loop, a
+            # shutdown signal sets stop_event and we bail immediately instead of
+            # holding the long-lived scheduler thread in a blocking sleep. The
+            # standalone CLI passes stop_event=None → plain time.sleep (unchanged).
+            if stop_event is not None:
+                if stop_event.wait(wait_time):
+                    return
+            else:
+                time.sleep(wait_time)
         else:
             log.info(f"  Attempt {attempt + 1}/{max_retries}: Checking SABnzbd queue...")
 
         # Get Sonarr queue to find download IDs for this season's episodes
         try:
-            sonarr_queue = sonarr_get(f"/queue?page=1&pageSize=200&includeUnknownSeriesItems=false")
+            sonarr_queue = sonarr_get(f"/queue?page=1&pageSize=200&includeUnknownSeriesItems=false", session=session)
         except Exception as e:
             log.warning(f"  Failed to get Sonarr queue for priority boost: {e}")
             if attempt == max_retries - 1:
@@ -1389,7 +1442,7 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
             continue
 
         # Get SABnzbd queue and match by nzo_id
-        sab_slots = sabnzbd_get_queue()
+        sab_slots = sabnzbd_get_queue(session=session)
 
         for slot in sab_slots:
             nzo_id = slot.get("nzo_id", "")
@@ -1414,7 +1467,7 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
                 log.info(f"  [DRY RUN] Would set {title} S{season_number:02d}E{ep_num:02d} "
                          f"to {priority_name} priority in SABnzbd")
             else:
-                if sabnzbd_set_priority(nzo_id, priority):
+                if sabnzbd_set_priority(nzo_id, priority, session=session):
                     log.info(f"  Set {title} S{season_number:02d}E{ep_num:02d} "
                              f"to {priority_name} priority in SABnzbd")
                     boosted += 1
@@ -1438,13 +1491,26 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
 # ============================================================
 # PLAYBACK DETECTION (Jellyfin /Sessions polling)
 # ============================================================
-def check_active_playback(conn):
+def check_active_playback(conn, session=None, stop_event=None):
     """Check Jellyfin active sessions for E01 playback on preview-only seasons.
-    If detected, unlock the full season and boost download priorities."""
+    If detected, unlock the full season and boost download priorities.
+
+    Args:
+        session: Optional thread-confined requests.Session. The scheduler's
+                 in-process playback loop owns ONE Session (and ONE conn) and
+                 passes it here so every Jellyfin/Sonarr/SABnzbd call reuses
+                 keep-alive connections on that single thread. None → module-level
+                 requests (standalone `playback` CLI, unchanged).
+        stop_event: Optional threading.Event (the scheduler's shutdown_event).
+                 When set, the long SABnzbd-queue wait — and the retry backoffs in
+                 boost_season_priority — return immediately so a SIGTERM doesn't
+                 freeze the scheduler or delay shutdown. None → blocking
+                 time.sleep (standalone CLI, unchanged).
+    """
     log.debug("Checking active playback sessions...")
 
     try:
-        sessions = jellyfin_get("/Sessions")
+        sessions = jellyfin_get("/Sessions", session=session)
     except Exception as e:
         log.warning(f"Failed to get Jellyfin sessions: {e}")
         return
@@ -1454,7 +1520,7 @@ def check_active_playback(conn):
 
     # Pre-fetch Sonarr series data to avoid lazy loading in loop
     try:
-        all_series = sonarr_get("/series")
+        all_series = sonarr_get("/series", session=session)
         if not isinstance(all_series, list):
             log.warning("Sonarr /series returned no usable list; skipping playback check this cycle")
             return
@@ -1469,12 +1535,15 @@ def check_active_playback(conn):
         log.warning(f"Failed to fetch Sonarr series for playback check: {e}")
         return  # Can't proceed without series data
 
-    for session in sessions:
-        now_playing = session.get("NowPlayingItem")
+    # NOTE: the loop variable is jf_session (a Jellyfin session dict), distinct
+    # from the `session` parameter (the optional HTTP requests.Session) so the
+    # two never shadow each other.
+    for jf_session in sessions:
+        now_playing = jf_session.get("NowPlayingItem")
         if not now_playing:
             continue
 
-        user_id = session.get("UserId", "")
+        user_id = jf_session.get("UserId", "")
         if user_id not in JELLYFIN_USER_IDS:
             continue
 
@@ -1485,7 +1554,7 @@ def check_active_playback(conn):
         # Must be E01
         ep_index = now_playing.get("IndexNumber")
         if ep_index != 1:
-            log.debug(f"  Playback detected: {session.get('UserName', user_id)} playing {now_playing.get('SeriesName', '')} S{now_playing.get('ParentIndexNumber', 0):02d}E{ep_index:02d} (not E01, skipping)")
+            log.debug(f"  Playback detected: {jf_session.get('UserName', user_id)} playing {now_playing.get('SeriesName', '')} S{now_playing.get('ParentIndexNumber', 0):02d}E{ep_index:02d} (not E01, skipping)")
             continue
 
         season_number = now_playing.get("ParentIndexNumber", 0)
@@ -1494,7 +1563,7 @@ def check_active_playback(conn):
 
         series_name = now_playing.get("SeriesName", "")
         series_jf_id = now_playing.get("SeriesId", "")
-        user_name = session.get("UserName", user_id)
+        user_name = jf_session.get("UserName", user_id)
 
         log.info(f"  Playback detected: {user_name} playing {series_name} S{season_number:02d}E01")
 
@@ -1503,7 +1572,7 @@ def check_active_playback(conn):
 
         if not sonarr_series and series_jf_id:
             try:
-                jf_series = jellyfin_get(f"/Items/{series_jf_id}", params={"Fields": "ProviderIds"})
+                jf_series = jellyfin_get(f"/Items/{series_jf_id}", params={"Fields": "ProviderIds"}, session=session)
                 tvdb_id = jf_series.get("ProviderIds", {}).get("Tvdb") if jf_series else None
                 if tvdb_id:
                     sonarr_series = series_by_tvdb.get(int(tvdb_id))
@@ -1525,7 +1594,7 @@ def check_active_playback(conn):
                  f"(user {user_name} started E01)")
 
         # Unlock the full season
-        sonarr_episodes = sonarr_get(f"/episode?seriesId={sonarr_id}")
+        sonarr_episodes = sonarr_get(f"/episode?seriesId={sonarr_id}", session=session)
         if not isinstance(sonarr_episodes, list):
             log.warning(f"  No usable episode list for {series_name}; skipping playback unlock this cycle")
             continue
@@ -1539,26 +1608,34 @@ def check_active_playback(conn):
             for ep in season_episodes:
                 if not ep.get("monitored"):
                     ep["monitored"] = True
-                    sonarr_put(f"/episode/{ep['id']}", ep)
+                    sonarr_put(f"/episode/{ep['id']}", ep, session=session)
 
             try:
                 sonarr_post("/command", {
                     "name": "SeasonSearch",
                     "seriesId": sonarr_id,
                     "seasonNumber": season_number
-                })
+                }, session=session)
                 log.info(f"  Triggered search for {series_name} Season {season_number}")
             except Exception as e:
                 log.warning(f"  Failed to trigger search: {e}")
 
         mark_season_unlocked(conn, sonarr_id, season_number, f"playback:{user_name}")
 
-        # Wait for downloads to appear in SABnzbd, then boost
+        # Wait for downloads to appear in SABnzbd, then boost. This ~120s wait is
+        # the big one — in-process under the scheduler it MUST be interruptible so
+        # a SIGTERM doesn't freeze the loop thread / delay container shutdown. The
+        # standalone CLI passes stop_event=None → plain blocking sleep (unchanged).
         if not DRY_RUN:
             log.info(f"  Waiting {SABNZBD_QUEUE_WAIT_SECONDS}s for downloads to appear in SABnzbd...")
-            time.sleep(SABNZBD_QUEUE_WAIT_SECONDS)
+            if stop_event is not None:
+                if stop_event.wait(SABNZBD_QUEUE_WAIT_SECONDS):
+                    return  # shutdown requested — bail out promptly
+            else:
+                time.sleep(SABNZBD_QUEUE_WAIT_SECONDS)
 
-        boost_season_priority(conn, sonarr_id, season_number, series_name, force_e02=True)
+        boost_season_priority(conn, sonarr_id, season_number, series_name, force_e02=True,
+                              session=session, stop_event=stop_event)
 
 
 # ============================================================
