@@ -64,9 +64,15 @@ def next_discovery_run():
     return target
 
 
-# Separate locks for polling vs webhook vs playback vs trakt processing
+# Separate locks for polling vs playback vs trakt processing.
+# Note: there is deliberately NO webhook_lock. Cross-process double-processing of
+# the same series is already prevented by claim_series_for_processing in
+# media_automation.py (atomic INSERT ... ON CONFLICT DO NOTHING with stale
+# recovery), which an in-memory lock could never do across subprocesses. Holding
+# a lock across the whole webhook subprocess only serialized unrelated series —
+# turning a Trakt bulk-add burst of ~10 SeriesAdd webhooks into ~12 minutes — so
+# the lock was removed. Webhooks now run concurrently via webhook_executor.
 poll_lock = threading.Lock()
-webhook_lock = threading.Lock()
 playback_lock = threading.Lock()
 trakt_lock = threading.Lock()
 
@@ -174,23 +180,27 @@ def run_playback_script():
 
 
 def run_webhook_script(series_id):
-    """Run the webhook script for a single series. Waits if another webhook is processing."""
-    # Block and wait (don't skip) - every webhook series must be processed
-    with webhook_lock:
-        try:
-            cmd = [sys.executable, "/app/media_automation.py", "webhook", str(series_id)]
-            log.info(f"Running: {' '.join(cmd)}")
-            result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
-            if result.returncode != 0:
-                log.error(f"Webhook script exited with code {result.returncode}")
-                return False
-            return True
-        except subprocess.TimeoutExpired:
-            log.error(f"Webhook script timed out after {SCRIPT_TIMEOUT}s")
+    """Run the webhook script for a single series.
+
+    Runs WITHOUT any in-memory lock so webhooks for different series proceed
+    concurrently (bounded by webhook_executor's max_workers). Double-processing of
+    the *same* series across the poll/webhook subprocesses is prevented by
+    claim_series_for_processing in media_automation.py, not by a scheduler lock.
+    """
+    try:
+        cmd = [sys.executable, "/app/media_automation.py", "webhook", str(series_id)]
+        log.info(f"Running: {' '.join(cmd)}")
+        result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
+        if result.returncode != 0:
+            log.error(f"Webhook script exited with code {result.returncode}")
             return False
-        except Exception as e:
-            log.error(f"Failed to run webhook script: {e}", exc_info=True)
-            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.error(f"Webhook script timed out after {SCRIPT_TIMEOUT}s")
+        return False
+    except Exception as e:
+        log.error(f"Failed to run webhook script: {e}", exc_info=True)
+        return False
 
 
 def process_webhook_series(series_id):

@@ -1410,5 +1410,77 @@ class ParseEnvListCommentTests(unittest.TestCase):
         self.assertEqual(result, ["Some#Value", "Other"])
 
 
+class WebhookConcurrencyTests(unittest.TestCase):
+    """WI-1 (2026-06-16): the redundant webhook_lock was removed so a Trakt
+    bulk-add burst of ~10 SeriesAdd webhooks no longer serializes into ~12
+    minutes. Each run_webhook_script held webhook_lock across the whole
+    subprocess (which sleeps 15+10+20+30s), so DIFFERENT series queued behind
+    each other for no reason — claim_series_for_processing already prevents
+    double-processing of the SAME series across processes, which an in-memory
+    lock never could.
+
+    This proves NON-serialization: two run_webhook_script calls for different
+    series, each made to take ~0.3s, overlap rather than running back-to-back.
+    Hermetic — _run_tracked is patched to sleep, so no real subprocess/network.
+    """
+
+    def test_no_webhook_lock_attribute(self):
+        """The redundant lock is gone entirely (not just unused)."""
+        self.assertFalse(
+            hasattr(scheduler, "webhook_lock"),
+            "webhook_lock must be removed; cross-process claim handles dedup",
+        )
+
+    def test_different_series_webhooks_run_concurrently(self):
+        """Two webhooks for different series must overlap. We patch _run_tracked
+        to sleep ~0.3s and return a success-coded process, fire two
+        run_webhook_script calls on separate threads, and assert total wall-time
+        is well under 2× a single call — impossible if they serialized."""
+        SLEEP = 0.3
+        started = []
+        start_lock = threading.Lock()
+
+        def fake_run_tracked(cmd, timeout):
+            with start_lock:
+                started.append(time.monotonic())
+            time.sleep(SLEEP)
+            proc = MagicMock()
+            proc.returncode = 0
+            return proc
+
+        results = {}
+
+        def call(series_id):
+            results[series_id] = scheduler.run_webhook_script(series_id)
+
+        with patch.object(scheduler, "_run_tracked", side_effect=fake_run_tracked):
+            t0 = time.monotonic()
+            threads = [
+                threading.Thread(target=call, args=(101,)),
+                threading.Thread(target=call, args=(202,)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            elapsed = time.monotonic() - t0
+
+        # Both calls ran to completion successfully.
+        self.assertEqual(results, {101: True, 202: True})
+        self.assertEqual(len(started), 2, "both webhook subprocesses should have started")
+        # Overlap proof: if serialized, wall-time would be ~2*SLEEP. With the lock
+        # gone they overlap, so total is well under that. Generous margin for CI.
+        self.assertLess(
+            elapsed, 1.7 * SLEEP,
+            f"webhooks for different series serialized (elapsed={elapsed:.3f}s, "
+            f"single-call≈{SLEEP}s); the lock should be gone",
+        )
+        # The two starts are near-simultaneous, not separated by a full SLEEP.
+        self.assertLess(
+            abs(started[1] - started[0]), 0.5 * SLEEP,
+            "the second webhook waited for the first — it was serialized",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
