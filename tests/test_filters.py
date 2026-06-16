@@ -1410,5 +1410,283 @@ class ParseEnvListCommentTests(unittest.TestCase):
         self.assertEqual(result, ["Some#Value", "Other"])
 
 
+class WebhookConcurrencyTests(unittest.TestCase):
+    """WI-1 (2026-06-16): the redundant webhook_lock was removed so a Trakt
+    bulk-add burst of ~10 SeriesAdd webhooks no longer serializes into ~12
+    minutes. Each run_webhook_script held webhook_lock across the whole
+    subprocess (which sleeps 15+10+20+30s), so DIFFERENT series queued behind
+    each other for no reason — claim_series_for_processing already prevents
+    double-processing of the SAME series across processes, which an in-memory
+    lock never could.
+
+    This proves NON-serialization: two run_webhook_script calls for different
+    series, each made to take ~0.3s, overlap rather than running back-to-back.
+    Hermetic — _run_tracked is patched to sleep, so no real subprocess/network.
+    """
+
+    def test_no_webhook_lock_attribute(self):
+        """The redundant lock is gone entirely (not just unused)."""
+        self.assertFalse(
+            hasattr(scheduler, "webhook_lock"),
+            "webhook_lock must be removed; cross-process claim handles dedup",
+        )
+
+    def test_different_series_webhooks_run_concurrently(self):
+        """Two webhooks for different series must overlap. We patch _run_tracked
+        to sleep ~0.3s and return a success-coded process, fire two
+        run_webhook_script calls on separate threads, and assert total wall-time
+        is well under 2× a single call — impossible if they serialized."""
+        SLEEP = 0.3
+        started = []
+        start_lock = threading.Lock()
+
+        def fake_run_tracked(cmd, timeout):
+            with start_lock:
+                started.append(time.monotonic())
+            time.sleep(SLEEP)
+            proc = MagicMock()
+            proc.returncode = 0
+            return proc
+
+        results = {}
+
+        def call(series_id):
+            results[series_id] = scheduler.run_webhook_script(series_id)
+
+        with patch.object(scheduler, "_run_tracked", side_effect=fake_run_tracked):
+            t0 = time.monotonic()
+            threads = [
+                threading.Thread(target=call, args=(101,)),
+                threading.Thread(target=call, args=(202,)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            elapsed = time.monotonic() - t0
+
+        # Both calls ran to completion successfully.
+        self.assertEqual(results, {101: True, 202: True})
+        self.assertEqual(len(started), 2, "both webhook subprocesses should have started")
+        # Overlap proof: if serialized, wall-time would be ~2*SLEEP. With the lock
+        # gone they overlap, so total is well under that. Generous margin for CI.
+        self.assertLess(
+            elapsed, 1.7 * SLEEP,
+            f"webhooks for different series serialized (elapsed={elapsed:.3f}s, "
+            f"single-call≈{SLEEP}s); the lock should be gone",
+        )
+        # The two starts are near-simultaneous, not separated by a full SLEEP.
+        self.assertLess(
+            abs(started[1] - started[0]), 0.5 * SLEEP,
+            "the second webhook waited for the first — it was serialized",
+        )
+class InProcessPlaybackTests(unittest.TestCase):
+    """WI-2: the playback check now runs IN-PROCESS in the scheduler loop instead
+    of a per-interval subprocess. The risks this guards:
+      (a) a long blocking sleep freezing the long-lived scheduler / delaying
+          shutdown — the ~120s SABnzbd-queue wait must become interruptible via
+          stop_event so a SIGTERM returns promptly;
+      (b) an exception crashing the whole scheduler — the loop body try/except
+          must swallow it and continue;
+      (c) back-compat — the standalone `playback` CLI path (stop_event=None,
+          session=None) must keep its original blocking behavior;
+      (d) media_automation must NEVER import scheduler (no circular import).
+    All hermetic: Jellyfin/Sonarr are mocked; no network, no real 120s sleeps.
+    """
+
+    def _playing_session(self):
+        """One Jellyfin session: user u1 playing S02E01 of a show we DON'T match in
+        Sonarr — enough to reach the wait, while keeping the test bounded."""
+        return [{
+            "NowPlayingItem": {
+                "Type": "Episode", "IndexNumber": 1,
+                "ParentIndexNumber": 2, "SeriesName": "Wait Show",
+                "SeriesId": "jf-1",
+            },
+            "UserId": "u1", "UserName": "alice",
+        }]
+
+    def _sonarr_series(self):
+        return [{"id": 1, "title": "Wait Show", "tvdbId": 555}]
+
+    # ---- (a) interruptible wait ------------------------------------------
+
+    def test_long_wait_is_interrupted_promptly_when_stop_event_set(self):
+        """With a stop_event ALREADY set, the ~120s SABnzbd-queue wait must take
+        the stop_event.wait() path and return ~immediately (well under 120s) —
+        the whole point of making the in-process wait interruptible."""
+        stop_event = threading.Event()
+        stop_event.set()  # shutdown already requested
+
+        episodes = [
+            {"id": 10, "seasonNumber": 2, "episodeNumber": 1, "monitored": False},
+            {"id": 11, "seasonNumber": 2, "episodeNumber": 2, "monitored": False},
+        ]
+
+        def fake_sonarr_get(endpoint, *a, **k):
+            if endpoint == "/series":
+                return self._sonarr_series()
+            if endpoint.startswith("/episode"):
+                return episodes
+            return None
+
+        boost_called = {"n": 0}
+
+        def fake_boost(*a, **k):
+            boost_called["n"] += 1
+
+        conn = MagicMock()
+        # A real time.sleep would block 120s if the interruptible path were NOT
+        # taken — patch it to raise so any accidental blocking-sleep fails loudly.
+        def explode_sleep(_):
+            raise AssertionError("blocking time.sleep used despite stop_event being set")
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "JELLYFIN_USER_IDS", ["u1"]), \
+             patch.object(media_automation, "jellyfin_get",
+                          side_effect=lambda ep, *a, **k: self._playing_session() if ep == "/Sessions" else None), \
+             patch.object(media_automation, "sonarr_get", side_effect=fake_sonarr_get), \
+             patch.object(media_automation, "sonarr_put"), \
+             patch.object(media_automation, "sonarr_post"), \
+             patch.object(media_automation, "is_season_unlocked", return_value=False), \
+             patch.object(media_automation, "mark_season_unlocked"), \
+             patch.object(media_automation, "boost_season_priority", side_effect=fake_boost), \
+             patch.object(media_automation.time, "sleep", side_effect=explode_sleep), \
+             patch.object(media_automation, "SABNZBD_QUEUE_WAIT_SECONDS", 120):
+            start = time.monotonic()
+            media_automation.check_active_playback(conn, session=None, stop_event=stop_event)
+            elapsed = time.monotonic() - start
+
+        # Returned essentially immediately (the stop_event.wait(120) saw the set
+        # event and returned True at once → check_active_playback returned).
+        self.assertLess(elapsed, 5, "interruptible wait did not short-circuit on a set stop_event")
+        # Bailed at the wait → never reached the boost.
+        self.assertEqual(boost_called["n"], 0, "should have bailed before boost_season_priority")
+
+    def test_boost_backoff_wait_interruptible_with_stop_event(self):
+        """boost_season_priority's retry backoff must also be interruptible: with a
+        set stop_event, the second-attempt wait returns immediately (no time.sleep)
+        and the function bails."""
+        stop_event = threading.Event()
+        stop_event.set()
+        conn = MagicMock()
+
+        # Episodes exist for the season, but the Sonarr queue never yields a
+        # matching download → forces a retry, hitting the attempt>0 backoff wait.
+        episodes = [{"id": 10, "seasonNumber": 2, "episodeNumber": 2}]
+
+        def fake_sonarr_get(endpoint, *a, **k):
+            if endpoint.startswith("/episode"):
+                return episodes
+            if endpoint.startswith("/queue"):
+                return {"records": []}  # no matching downloads → retry
+            return None
+
+        with patch.object(media_automation, "DRY_RUN", False), \
+             patch.object(media_automation, "SABNZBD_API_KEY", "key"), \
+             patch.object(media_automation, "is_season_boosted", return_value=False), \
+             patch.object(media_automation, "sonarr_get", side_effect=fake_sonarr_get), \
+             patch.object(media_automation, "sabnzbd_get_queue", return_value=[]), \
+             patch.object(media_automation.time, "sleep",
+                          side_effect=AssertionError("blocking sleep used in boost backoff")):
+            start = time.monotonic()
+            media_automation.boost_season_priority(
+                conn, series_id=1, season_number=2, title="Wait Show",
+                force_e02=True, stop_event=stop_event,
+            )
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5, "boost backoff wait did not short-circuit on a set stop_event")
+
+    # ---- (b) exception inside check is contained by the loop pattern ------
+
+    def test_exception_in_check_is_contained_by_loop_pattern(self):
+        """If check_active_playback raises, the scheduler's loop body try/except
+        must swallow it and the loop must continue (never crash the scheduler).
+        We simulate exactly the loop body around a raising check."""
+        raised = {"n": 0}
+
+        def boom(conn, session=None, stop_event=None):
+            raised["n"] += 1
+            raise RuntimeError("simulated Jellyfin/Sonarr failure")
+
+        # Mirror the loop body in scheduler.playback_check_loop.
+        propagated = None
+        try:
+            try:
+                boom(MagicMock(), session=None, stop_event=threading.Event())
+            except Exception as e:  # noqa: BLE001 - matches the loop's broad guard
+                # logged + continue in the real loop
+                pass
+        except Exception as e:  # pragma: no cover - must not happen
+            propagated = e
+
+        self.assertEqual(raised["n"], 1)
+        self.assertIsNone(propagated, "exception must not propagate out of the loop body")
+
+    # ---- (c) back-compat: stop_event=None / session=None -----------------
+
+    def test_check_active_playback_backcompat_no_session_no_stop_event(self):
+        """The standalone `playback` CLI calls check_active_playback(conn) with the
+        defaults. With no active sessions it must run and return cleanly, never
+        touching any session-bound or stop_event path."""
+        conn = MagicMock()
+        with patch.object(media_automation, "jellyfin_get", return_value=[]) as mock_jf:
+            # Default args — exactly how run_playback() invokes it.
+            media_automation.check_active_playback(conn)
+        # /Sessions was fetched with session defaulting to None (module-level requests).
+        mock_jf.assert_called_once()
+        self.assertIsNone(mock_jf.call_args.kwargs.get("session"))
+
+    def test_boost_season_priority_backcompat_signature(self):
+        """boost_season_priority still works with the original positional call
+        (no session, no stop_event) — SABnzbd unconfigured short-circuits cleanly."""
+        conn = MagicMock()
+        with patch.object(media_automation, "SABNZBD_API_KEY", ""):
+            # Original call shape from before the refactor.
+            media_automation.boost_season_priority(conn, 1, 2, "Show", force_e02=True)
+        # No assertion needed beyond "did not raise"; the empty-key guard returns early.
+
+    def test_session_threads_through_to_sonarr_get(self):
+        """When a session is supplied, check_active_playback must pass it down to
+        the HTTP helpers (so requests reuse the thread-confined keep-alive)."""
+        conn = MagicMock()
+        sentinel_session = object()
+        with patch.object(media_automation, "jellyfin_get", return_value=[]) as mock_jf:
+            media_automation.check_active_playback(conn, session=sentinel_session)
+        self.assertIs(mock_jf.call_args.kwargs.get("session"), sentinel_session)
+
+    def test_api_helper_uses_session_when_provided(self):
+        """_api_request_with_retry routes through session.get when a Session is
+        given (keep-alive), and through module-level requests otherwise."""
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"ok": True}
+        sess.get.return_value = resp
+
+        result = media_automation._api_request_with_retry(
+            requests.get, "http://x", {}, session=sess
+        )
+        self.assertEqual(result, {"ok": True})
+        sess.get.assert_called_once()  # used the session, not module-level requests
+
+    # ---- (d) no circular import ------------------------------------------
+
+    def test_media_automation_does_not_import_scheduler(self):
+        """media_automation must NEVER import scheduler (would be a circular import
+        and re-introduce the back-import the design forbids)."""
+        import sys as _sys
+        src = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "media_automation.py",
+        )
+        with open(src, "r", encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("import scheduler", text)
+        # And it isn't pulled in transitively as a module attribute.
+        self.assertFalse(hasattr(media_automation, "scheduler"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 import json
 
+import requests
+
+# The playback check now runs IN-PROCESS in playback_check_loop (no subprocess
+# per interval). media_automation owns all the playback logic; the scheduler
+# only owns the long-lived resources (one sqlite conn + one requests.Session)
+# and the loop/error boundary. The dependency is one-directional: scheduler
+# imports media_automation, media_automation MUST NEVER import scheduler.
+import media_automation
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -34,7 +43,9 @@ RUN_CATCHUP_ON_START = os.getenv("RUN_CATCHUP_ON_START", "false").lower() == "tr
 WEBHOOK_PORT = get_int_env("WEBHOOK_PORT", 9191)
 SCRIPT_TIMEOUT = get_int_env("SCRIPT_TIMEOUT_MINUTES", 30) * 60
 PLAYBACK_CHECK_INTERVAL = get_int_env("PLAYBACK_CHECK_INTERVAL", 45)
-PLAYBACK_SCRIPT_TIMEOUT = get_int_env("PLAYBACK_SCRIPT_TIMEOUT", 600)
+# (PLAYBACK_SCRIPT_TIMEOUT removed: the playback check is now in-process, with
+# interruptible bounded waits + per-call timeout=30, so the old subprocess
+# hard-timeout no longer applies.)
 
 # Trakt discovery
 TRAKT_DISCOVERY_ENABLED = os.getenv("TRAKT_DISCOVERY_ENABLED", "false").lower() == "true"
@@ -64,9 +75,15 @@ def next_discovery_run():
     return target
 
 
-# Separate locks for polling vs webhook vs playback vs trakt processing
+# Separate locks for polling vs playback vs trakt processing.
+# Note: there is deliberately NO webhook_lock. Cross-process double-processing of
+# the same series is already prevented by claim_series_for_processing in
+# media_automation.py (atomic INSERT ... ON CONFLICT DO NOTHING with stale
+# recovery), which an in-memory lock could never do across subprocesses. Holding
+# a lock across the whole webhook subprocess only serialized unrelated series —
+# turning a Trakt bulk-add burst of ~10 SeriesAdd webhooks into ~12 minutes — so
+# the lock was removed. Webhooks now run concurrently via webhook_executor.
 poll_lock = threading.Lock()
-webhook_lock = threading.Lock()
 playback_lock = threading.Lock()
 trakt_lock = threading.Lock()
 
@@ -149,48 +166,28 @@ def run_poll_script(args=None):
         poll_lock.release()
 
 
-def run_playback_script():
-    """Run the playback check script."""
-    if not playback_lock.acquire(blocking=False):
-        log.debug("Playback check already running, skipping")
-        return False
+def run_webhook_script(series_id):
+    """Run the webhook script for a single series.
 
+    Runs WITHOUT any in-memory lock so webhooks for different series proceed
+    concurrently (bounded by webhook_executor's max_workers). Double-processing of
+    the *same* series across the poll/webhook subprocesses is prevented by
+    claim_series_for_processing in media_automation.py, not by a scheduler lock.
+    """
     try:
-        cmd = [sys.executable, "/app/media_automation.py", "playback"]
-        log.debug(f"Running: {' '.join(cmd)}")
-        result = _run_tracked(cmd, timeout=PLAYBACK_SCRIPT_TIMEOUT)
+        cmd = [sys.executable, "/app/media_automation.py", "webhook", str(series_id)]
+        log.info(f"Running: {' '.join(cmd)}")
+        result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
         if result.returncode != 0:
-            log.error(f"Playback script exited with code {result.returncode}")
+            log.error(f"Webhook script exited with code {result.returncode}")
             return False
         return True
     except subprocess.TimeoutExpired:
-        log.error(f"Playback script timed out after {PLAYBACK_SCRIPT_TIMEOUT}s")
+        log.error(f"Webhook script timed out after {SCRIPT_TIMEOUT}s")
         return False
     except Exception as e:
-        log.error(f"Failed to run playback script: {e}", exc_info=True)
+        log.error(f"Failed to run webhook script: {e}", exc_info=True)
         return False
-    finally:
-        playback_lock.release()
-
-
-def run_webhook_script(series_id):
-    """Run the webhook script for a single series. Waits if another webhook is processing."""
-    # Block and wait (don't skip) - every webhook series must be processed
-    with webhook_lock:
-        try:
-            cmd = [sys.executable, "/app/media_automation.py", "webhook", str(series_id)]
-            log.info(f"Running: {' '.join(cmd)}")
-            result = _run_tracked(cmd, timeout=SCRIPT_TIMEOUT)
-            if result.returncode != 0:
-                log.error(f"Webhook script exited with code {result.returncode}")
-                return False
-            return True
-        except subprocess.TimeoutExpired:
-            log.error(f"Webhook script timed out after {SCRIPT_TIMEOUT}s")
-            return False
-        except Exception as e:
-            log.error(f"Failed to run webhook script: {e}", exc_info=True)
-            return False
 
 
 def process_webhook_series(series_id):
@@ -333,32 +330,66 @@ def run_trakt_script(args=None):
 
 
 def playback_check_loop():
-    """Background loop that checks for active playback every N seconds.
+    """Background loop that checks for active playback every N seconds — IN-PROCESS.
 
-    TODO (P2-10, deferred): each iteration shells out to a fresh
-    `python /app/media_automation.py playback` subprocess via run_playback_script().
-    With the default PLAYBACK_CHECK_INTERVAL=45s that is ~1900 cold Python
-    interpreter starts/day, each of which re-imports the module and re-opens the
-    SQLite DB and a new HTTP connection to Jellyfin/Sonarr just to poll for active
-    sessions — pure overhead for a check that is usually a no-op.
+    Previously each interval shelled out to a fresh `python media_automation.py
+    playback` subprocess (~1900 cold interpreter starts/day at the default 45s).
+    We now run the check in-process, reusing ONE long-lived sqlite3 connection and
+    ONE requests.Session (keep-alive) across iterations.
 
-    Recommended future direction: run the playback poll in-process here, reusing a
-    single long-lived sqlite3 connection and one requests.Session (keep-alive) across
-    iterations instead of spawning a subprocess. That work is intentionally NOT done
-    in this change because the playback logic lives in media_automation.py (owned by
-    a sibling change) and refactoring it for safe in-process reuse — connection
-    lifecycle, thread-safety with the webhook/poll paths, DRY_RUN handling — is the
-    riskiest part. Keep the subprocess model until that migration is scoped.
+    Safety design (these resources are confined to THIS single loop thread):
+      - conn + session are created once here and used ONLY by this thread, so we
+        sidestep sqlite/requests cross-thread concerns. The poll/webhook paths
+        keep using their own subprocesses with their own connections.
+      - shutdown_event is passed to check_active_playback as stop_event, so the
+        long SABnzbd-queue wait (~120s) and the boost retry-backoffs become
+        interruptible: a SIGTERM returns from the wait immediately instead of
+        freezing this thread / delaying container shutdown.
+      - The per-iteration call is wrapped in try/except so any playback failure
+        is logged and the loop continues — it must NEVER crash the scheduler.
+      - We accept the loss of the old 600s subprocess hard-timeout: every wait is
+        now bounded + interruptible and every API call carries timeout=30.
     """
-    log.info(f"Playback check loop started (interval: {PLAYBACK_CHECK_INTERVAL}s)")
-    while not shutdown_event.is_set():
-        try:
-            run_playback_script()
-        except Exception as e:
-            log.error(f"Error in playback check loop: {e}", exc_info=True)
-        # wait() returns True if event was set during the wait — break promptly on SIGTERM
-        if shutdown_event.wait(PLAYBACK_CHECK_INTERVAL):
-            break
+    log.info(f"Playback check loop started (interval: {PLAYBACK_CHECK_INTERVAL}s, in-process)")
+
+    # Long-lived resources owned solely by this loop thread.
+    conn = None
+    session = None
+    try:
+        conn = media_automation.init_db()
+        if not media_automation.check_db_writable(conn):
+            log.error("Playback loop: DB not writable; playback checks disabled this run")
+            return  # finally closes conn
+        session = requests.Session()
+
+        while not shutdown_event.is_set():
+            try:
+                media_automation.check_active_playback(
+                    conn, session=session, stop_event=shutdown_event
+                )
+            except Exception as e:
+                # Error boundary: a playback failure must never crash the scheduler.
+                log.error(f"Error in playback check loop: {e}", exc_info=True)
+            # wait() returns True if event was set during the wait — break promptly on SIGTERM
+            if shutdown_event.wait(PLAYBACK_CHECK_INTERVAL):
+                break
+    except Exception as e:
+        # Setup (init_db / Session) failed — log and exit the thread cleanly rather
+        # than letting an unhandled exception kill it silently.
+        log.error(f"Playback loop failed to start: {e}", exc_info=True)
+    finally:
+        # Close the long-lived resources on shutdown (or setup failure).
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        log.info("Playback check loop stopped")
 
 
 def trakt_discovery_loop():
