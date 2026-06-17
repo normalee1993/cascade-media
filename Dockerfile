@@ -1,4 +1,7 @@
-FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca  # python:3.11-slim
+# Base image: python:3.11-slim, pinned by digest for reproducible builds.
+# NOTE: the comment MUST be on its own line — Docker treats a trailing comment
+# on a FROM line as extra arguments ("FROM requires either one or three arguments").
+FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca
 
 WORKDIR /app
 
