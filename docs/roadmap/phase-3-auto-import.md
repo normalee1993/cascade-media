@@ -1,4 +1,4 @@
-# Phase 3 (Tier 2a) — "Matched by ID" auto-import (Sonarr + Radarr) → tag v1.9.0 (MINOR)
+# Phase 3 (Tier 2a) — "Matched by ID" auto-import (Sonarr + Radarr) → tag v1.8.0 (MINOR)
 
 > Self-contained handoff. See `_shared-conventions.md` for repo/test/release conventions.
 
@@ -34,4 +34,4 @@ All changes in `media_automation.py`.
 ## Verify
 - Full suite green via the docker-run command in `_shared-conventions.md`.
 - Live dry-run with a known stuck item present: `docker exec -e DRY_RUN=true cascade-media python -u /app/media_automation.py` — confirm it identifies the by-ID blocks (Sonarr and Radarr) and lists them; a non-DRY run should clear them from the queue (check Activity → Queue).
-- Open PR, merge, then tag **v1.9.0** (MINOR — new feature; off unless Radarr/Sonarr keys configured).
+- Open PR, merge, then tag **v1.8.0** (MINOR — new feature; off unless Radarr/Sonarr keys configured).

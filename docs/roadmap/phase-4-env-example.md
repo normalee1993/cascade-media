@@ -1,4 +1,4 @@
-# Phase 4 (Tier 2b) — Improve `.env.example` → tag v1.9.1 (PATCH, docs)
+# Phase 4 (Tier 2b) — Improve `.env.example` → tag v1.8.1 (PATCH, docs)
 
 > Self-contained handoff. See `_shared-conventions.md` for repo/test/release conventions.
 
@@ -20,4 +20,4 @@ Edit `.env.example` only (docs-only change).
 
 ## Verify
 - Spin a fresh container (or `docker run` with these example values) under `DRY_RUN=true` and run the Phase 2 validator: `docker exec cascade-media python -u /app/trakt_discovery.py validate` — all example-derived values parse cleanly with no warnings.
-- Open PR, merge, then tag **v1.9.1** (PATCH — docs/config only).
+- Open PR, merge, then tag **v1.8.1** (PATCH — docs/config only).
