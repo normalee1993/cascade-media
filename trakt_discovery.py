@@ -323,9 +323,17 @@ def trakt_post(endpoint, data=None, headers_override=None):
 
 
 def _send_alert_email(subject, body):
-    """Send alert via SMTP. No-op if SMTP config is incomplete."""
+    """Send alert via SMTP. No-op if SMTP config is incomplete.
+
+    Returns None if email isn't configured (nothing attempted), True if the
+    message was handed to the SMTP server without error, or False if the send
+    raised. SMTP has no HTTP-style status code, so "success" means send_message
+    completed without an exception (and, per RFC 5321, the server accepted at
+    least one recipient — smtplib raises SMTPRecipientsRefused otherwise).
+    Existing callers ignore the return value, so their behavior is unchanged.
+    """
     if not (SMTP_HOST and ALERT_EMAIL_TO and ALERT_EMAIL_FROM):
-        return
+        return None
     import smtplib
     from email.message import EmailMessage
     full_subject = f"{ALERT_EMAIL_SUBJECT_PREFIX} {subject}".strip()
@@ -347,8 +355,10 @@ def _send_alert_email(subject, body):
                     s.login(SMTP_USER, SMTP_PASS)
                 s.send_message(msg)
         log.info(f"Alert email sent to {ALERT_EMAIL_TO}")
+        return True
     except Exception as e:
         log.warning(f"Alert email failed: {e}")
+        return False
 
 
 def _send_alert_webhook(message, subject="Token refresh failure"):
@@ -356,18 +366,42 @@ def _send_alert_webhook(message, subject="Token refresh failure"):
 
     Fans out to both webhook (Discord/Slack/ntfy.sh) and email channels — either
     or both may be configured. Name kept for backward compatibility with callers.
+
+    Returns a per-channel result dict so callers that care about delivery (the
+    `test-alert --verify` path) can report it. Each value is one of:
+      None    — channel not configured, nothing attempted
+      a tuple (ok: bool, status) — channel attempted; `status` is the HTTP
+                status code for the webhook (or None on a transport exception)
+                and the literal string "sent"/"error" for email (SMTP has no
+                HTTP status). Existing callers ignore this return value, so
+                their fire-and-forget behavior is unchanged.
     """
+    webhook_result = None
     if ALERT_WEBHOOK_URL:
         payload = {"content": message, "text": message}
         try:
-            requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
-            log.info("Alert webhook sent")
+            resp = requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
+            status = getattr(resp, "status_code", None)
+            ok = status is not None and 200 <= status < 300
+            if ok:
+                log.info("Alert webhook sent")
+            else:
+                log.warning(f"Alert webhook returned non-2xx status: {status}")
+            webhook_result = (ok, status)
         except Exception as e:
             # The exception string can embed the full ALERT_WEBHOOK_URL, which
             # for Discord/Slack includes a secret token. Log only the exception
             # type so the token never lands in `docker logs`.
             log.warning(f"Alert webhook failed: {type(e).__name__}")
-    _send_alert_email(subject, message)
+            webhook_result = (False, None)
+
+    email_ok = _send_alert_email(subject, message)
+    if email_ok is None:
+        email_result = None
+    else:
+        email_result = (email_ok, "sent" if email_ok else "error")
+
+    return {"webhook": webhook_result, "email": email_result}
 
 
 def _send_alert_once(flag_name, message, subject="Token refresh failure"):
@@ -1841,10 +1875,15 @@ def cmd_discover(conn):
     discover_content(conn)
 
 
-def cmd_test_alert(conn):
+def cmd_test_alert(conn, verify=False):
     """Send a test alert to all configured channels (webhook + email).
 
     Confirms the notification path works without waiting for a real token failure.
+
+    With verify=True, report each channel's send result (✓/✗ with the HTTP
+    status where the transport exposes one) and return False if any *configured*
+    channel failed to deliver, so the caller can exit non-zero. Without verify,
+    behavior is the unchanged fire-and-forget send.
     """
     configured = []
     if ALERT_WEBHOOK_URL:
@@ -1855,12 +1894,30 @@ def cmd_test_alert(conn):
         log.error("No alert channels configured. Set ALERT_WEBHOOK_URL and/or SMTP_* + ALERT_EMAIL_* in .env")
         return False
     log.info(f"Sending test alert to: {', '.join(configured)}")
-    _send_alert_webhook(
+    results = _send_alert_webhook(
         "This is a test alert from cascade-media. If you received this, your alert plumbing is working. "
         "Real alerts will fire when the Trakt token refresh fails and re-authentication is required.",
         subject="Test alert"
     )
-    return True
+    if not verify:
+        return True
+
+    # --verify: print a per-channel ✓/✗ summary and fail if any configured
+    # channel didn't deliver. results maps channel → None (not configured) or
+    # (ok, status); we only judge channels that were actually attempted.
+    all_ok = True
+    for channel, label in (("webhook", "webhook"),
+                           ("email", f"email→{ALERT_EMAIL_TO}")):
+        outcome = results.get(channel)
+        if outcome is None:
+            continue  # channel not configured — nothing to verify
+        ok, status = outcome
+        status_str = "" if status is None else f" ({_redact_secrets(status)})"
+        mark = "✓" if ok else "✗"
+        print(f"{mark} {label}{status_str}")
+        if not ok:
+            all_ok = False
+    return all_ok
 
 
 # ============================================================
@@ -2105,7 +2162,8 @@ def main():
         elif command == "discover":
             cmd_discover(conn)
         elif command == "test-alert":
-            success = cmd_test_alert(conn)
+            verify = "--verify" in sys.argv[2:]
+            success = cmd_test_alert(conn, verify=verify)
             sys.exit(0 if success else 1)
         elif command == "validate":
             send = "--send" in sys.argv[2:]
@@ -2114,6 +2172,7 @@ def main():
         else:
             print(f"Unknown command: {command}")
             print("Usage: python trakt_discovery.py [auth|reauth|discover|status|reset|test-alert|validate]")
+            print("       test-alert [--verify]  (--verify asserts each configured channel delivered)")
             print("       validate [--send]   (--send fires a real test alert)")
             sys.exit(1)
     finally:

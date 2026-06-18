@@ -1,4 +1,4 @@
-# Phase 5 (Tier 2c) — Alert webhook end-to-end test → tag v1.9.2 (PATCH)
+# Phase 5 (Tier 2c) — Alert webhook end-to-end test → tag v1.8.2 (PATCH)
 
 > Self-contained handoff. See `_shared-conventions.md` for repo/test/release conventions.
 
@@ -24,4 +24,4 @@ All changes in `trakt_discovery.py`.
 ## Verify
 - Full suite green via the docker-run command in `_shared-conventions.md`.
 - Live: `docker exec cascade-media python -u /app/trakt_discovery.py test-alert --verify` — each configured channel reports delivered; **user confirms receipt** in Discord/email (the one manual step that proves true end-to-end delivery).
-- Open PR, merge, then tag **v1.9.2** (PATCH).
+- Open PR, merge, then tag **v1.8.2** (PATCH).
