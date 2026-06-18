@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.8.0] - 2026-06-18
+
+Tier 2 backlog: operational auto-recovery and alert verification.
+
+### Added
+- **"Matched by ID" auto-import (Sonarr + Radarr).** Completed downloads whose release name doesn't self-parse to a library title (e.g. `Battlestar.Galactica.2005.S02E01`, or movies like `Batman: The Long Halloween (2021)`) get stuck as `importBlocked`/`importPending` — *"matched … by ID. Automatic import is not possible / Manual Import required."* The scheduler now detects these (state is import-blocked **and** the message matches the by-ID signature) and resolves them via `GET /manualimport?downloadId=…` → `POST /command {"name":"ManualImport","importMode":"auto"}`, so they no longer require a manual Activity→Queue import. A **new Radarr client** brings the same fix to movies. Conservative by design: it ignores unparseable season packs ("No files are eligible for import") and Custom-Format rejections. New env: `RADARR_URL`, `RADARR_API_KEY`, and `AUTO_IMPORT_BLOCKED` (default on; each side gated on its own API key). DRY_RUN logs what it would import and fires nothing.
+- **`test-alert --verify`.** The alert test command now reports per-channel delivery status (webhook HTTP status; email = accepted-by-server) with a ✓/✗ summary and a non-zero exit if any configured channel fails to send — so you can confirm the Discord/Slack/email path actually works, not just that it was attempted. The plain `test-alert` behavior is unchanged, and the production alert call-sites (token-failure / persistence / readonly) are untouched.
+
+### Changed
+- **`.env.example`** documents the new vars (`RADARR_*`, `AUTO_IMPORT_BLOCKED`, and the Tier 1 `INPROGRESS_BOOST_WINDOW_DAYS`).
+
+### Notes
+- SemVer: MINOR — backward-compatible features; auto-import is inert unless the relevant API key is set, and `--verify` is opt-in.
+- 183 unit tests pass (35 new across the two features).
+
 ## [v1.7.0] - 2026-06-18
 
 Tier 1 backlog: a daily-UX boost and a setup-safety command.
@@ -210,6 +225,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.8.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.8.0
 [v1.7.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.7.0
 [v1.6.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.1
 [v1.6.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.0
