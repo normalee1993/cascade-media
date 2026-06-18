@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.7.0] - 2026-06-18
+
+Tier 1 backlog: a daily-UX boost and a setup-safety command.
+
+### Added
+- **In-progress weekly priority boost.** When a new episode of a season you're actively watching lands in SABnzbd behind movies/other grabs, it's now bumped to **High** so it isn't stuck behind the queue for ~half a day. A new per-episode ledger (`episode_boosts`) tracks what's already been boosted, and the trigger is gated on a recency window — a tracked Jellyfin user must have played an episode of that season within `INPROGRESS_BOOST_WINDOW_DAYS` (new env, **default 7**, tuned for weekly-cadence shows; `<= 0` disables it). This complements the existing season-unlock boosts, which only fired on watch-progress/playback unlocks and never on routine weekly episodes of an already-unlocked season.
+- **`validate` command** (`trakt_discovery.py validate`) — one read-only probe of every integration (Trakt, TMDB, Seerr, Sonarr, Jellyfin, SABnzbd, alert channels) that prints a ✓/✗ per service so a misconfigured `.env` is caught immediately instead of surfacing as silent zero-request cycles. Resolves each `JELLYFIN_USER_IDS` entry and flags display-names that should be UUIDs. Exits non-zero if a required service (Trakt/Sonarr/Jellyfin) fails; secrets are redacted from all output. Optional `--send` also fires a test alert through each channel.
+
+### Notes
+- SemVer: MINOR — two backward-compatible features; the boost is inert unless a show is actively in-progress within the window, and `validate` is a new opt-in command.
+- 148 unit tests pass (35 new across the two features).
+
 ## [v1.6.1] - 2026-06-16
 
 ### Fixed
@@ -198,6 +210,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.7.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.7.0
 [v1.6.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.1
 [v1.6.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.0
 [v1.5.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.5.2
