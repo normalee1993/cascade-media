@@ -4,6 +4,55 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.6.1] - 2026-06-16
+
+### Fixed
+- **Docker image build unbroken.** `build-and-push` had been failing on every merge since v1.5.2 — a trailing `# python:3.11-slim` comment on the `FROM` line triggered `FROM requires either one or three arguments`. It slipped past PR checks because the image build only runs on merge to `main`, not on PRs. Consequence: GHCR `:latest` was stuck at v1.5.1, so the v1.5.2 and v1.6.0 code never actually deployed. The comment is moved to its own line above `FROM`; the digest pin is retained. First buildable release since v1.5.1.
+
+## [v1.6.0] - 2026-06-15
+
+### Changed
+- **Concurrent webhook processing (de-serialized).** The redundant `webhook_lock` is removed. It was held across the entire webhook subprocess (which sleeps 15+10+20+30s), so a Trakt bulk-add of ~10 shows serialized into ~12 minutes. The atomic `claim_series_for_processing` (`INSERT … ON CONFLICT`, added in v1.5.0) already prevents same-series double-processing across subprocesses — which the in-memory lock never could — so the lock was pure overhead. Webhooks now run concurrently via `webhook_executor` (max_workers=3). The poll/playback/trakt locks are untouched.
+- **In-process playback check.** The 45-second playback check no longer spawns a `media_automation.py playback` subprocess (~1900 cold starts/day); it runs inside the scheduler's playback thread. Done safely: parameter injection to avoid a circular import (`check_active_playback(conn, session=None, stop_event=None)`), interruptible `stop_event.wait()` for every playback-path sleep, a thread-confined `conn` + `requests.Session()`, an error boundary so a playback failure can't crash the scheduler, and a back-compatible `playback` CLI.
+
+### Notes
+- After deploy, the first 45s cycle should run playback in-process (no `Running: …playback` log lines) and still shut down gracefully in under ~2s.
+
+## [v1.5.2] - 2026-06-15
+
+### Security
+- **TMDB API key redacted from logs.** `tmdb_get` sends the key as an `?api_key=` query param, so on any request failure the `requests` exception string carried the key into `docker logs` (same class as the SABnzbd fix in v1.5.0). A `_redact_secrets()` helper now masks `api_key=…` in the URL/exception across all logging branches. The v3 query-param flow is kept (switching to a Bearer token would require a v4 token).
+
+### Changed
+- **Base image pinned to its digest** (`python:3.11-slim@sha256:…`) for reproducible builds.
+
+### Fixed
+- **Silent TVDB-ID collisions** in `check_watch_progress`/`check_active_playback` now log a warning naming both series and keep the first, instead of silently last-write-wins.
+- **`parse_env_list`** only treats `" #"` (space-then-hash) as an inline comment, so a legitimate token containing `#` survives while `value  # comment` still strips.
+
+## [v1.5.1] - 2026-06-14
+
+### Fixed
+- **Concurrency-safe `processed_series.status` migration.** On first start of the v1.5 image against an existing DB, the poll and playback subprocesses both ran `PRAGMA table_info` then `ALTER TABLE … ADD COLUMN status` at the same instant, so the loser logged `duplicate column name: status`. It self-healed but logged an alarming error on every fresh-DB upgrade. The migration is now `_ensure_status_column`, which swallows the benign duplicate-column collision (re-raising any other `OperationalError`); legacy rows are still backfilled to `'done'`.
+
+## [v1.5.0] - 2026-06-14
+
+Deep-review reliability & security hardening — items 1–5 from the codebase audit. **94 unit tests pass.**
+
+### Security
+- **Secret redaction.** The SABnzbd API key (passed as a URL query param) and the alert-webhook token no longer reach logs on connection errors.
+
+### Fixed
+- **Atomic + durable series claim** *(core reliability)*. A cross-process `INSERT … ON CONFLICT` claim plus a `status` column (`in_progress` → `done`) with stale-claim recovery. A crashed or failed monitoring setup is now retried instead of permanently flagging a show whose monitoring never applied — the bug that caused full-library downloads. An idempotent `ALTER TABLE` migration runs on first start.
+- **API/DB error contracts.** `None`-response guards at every Sonarr call site, a mass-delete plausibility guard in stale-DB cleanup, a media-side readonly-DB probe (skips cleanly and logs a chown hint), and HTTP-date `Retry-After` handling.
+- **Scheduler/webhook hardening.** `ThreadingHTTPServer`, a request socket timeout, 400/413 body handling (Content-Length parse moved inside the try, 1 MiB cap), and SIGTERM forwarded to the child subprocess for clean shutdown.
+
+### Changed
+- **Container renamed `media-automation` → `cascade-media`**, with a port-aware healthcheck (Dockerfile + compose), a `RUN_CATCHUP_ON_START=false` default, and `mem_limit`/`cpus` limits.
+
+### Upgrade notes
+- ⚠ The container rename needs a one-time **stop → rm → recreate** (a plain restart won't adopt the new name). Keep the same data-volume mapping — the SQLite DB and Trakt token live on the host volume and survive the rename. Item 2's DB migration is automatic and idempotent; no manual step.
+
 ## [v1.4.0] - 2026-06-11
 
 ### Added
@@ -149,6 +198,11 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.6.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.1
+[v1.6.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.0
+[v1.5.2]: https://github.com/normalee1993/cascade-media/releases/tag/v1.5.2
+[v1.5.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.5.1
+[v1.5.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.5.0
 [v1.4.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.4.0
 [v1.3.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.3.0
 [v1.2.4]: https://github.com/normalee1993/cascade-media/releases/tag/v1.2.4
