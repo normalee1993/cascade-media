@@ -161,6 +161,17 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 SEERR_HEADERS = {"X-Api-Key": SEERR_API_KEY, "Content-Type": "application/json"}
 SEERR_USER_ID = get_int_env("SEERR_USER_ID", 0)  # Seerr user ID to attribute requests to
 
+# Sonarr / Jellyfin / SABnzbd — not used by discovery itself; read here only so the
+# `validate` command can probe every integration the wider stack depends on. These
+# mirror the definitions in media_automation.py (the authoritative consumers).
+SONARR_URL = os.getenv("SONARR_URL", "")
+SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
+JELLYFIN_URL = os.getenv("JELLYFIN_URL", "")
+JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
+JELLYFIN_USER_IDS = parse_env_list("JELLYFIN_USER_IDS")
+SABNZBD_URL = os.getenv("SABNZBD_URL", "")
+SABNZBD_API_KEY = os.getenv("SABNZBD_API_KEY", "")
+
 # Database
 DB_PATH = os.getenv("DB_PATH", "/data/media_automation.db")
 
@@ -1853,6 +1864,227 @@ def cmd_test_alert(conn):
 
 
 # ============================================================
+# VALIDATE — connection / config probe for every integration
+# ============================================================
+# UUID (any version) — Jellyfin user IDs are UUIDs; a display name is the known
+# misconfiguration that produces silent zero-result watch syncs.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$"
+)
+
+
+def _validate_print_ok(service, detail):
+    print(f"✓ {service}: {_redact_secrets(detail)}")
+
+
+def _validate_print_fail(service, reason):
+    print(f"✗ {service}: {_redact_secrets(reason)}")
+
+
+def _probe_trakt(conn, results):
+    """Required. Token presence/validity + an authed ping."""
+    try:
+        tokens = load_tokens(conn)
+        if not tokens:
+            _validate_print_fail("Trakt", "no tokens in database — run 'auth'")
+            results["required_fail"] = True
+            return
+        expires_at = datetime.fromisoformat(tokens["expires_at"])
+        now = datetime.now(timezone.utc)
+        days_left = (expires_at - now).days
+        if now >= expires_at:
+            _validate_print_fail("Trakt", "token EXPIRED — run 'auth' to re-authenticate")
+            results["required_fail"] = True
+            return
+        # Authed ping — confirms the token is actually accepted, not just unexpired.
+        resp = trakt_get("/sync/last_activities", auth_required=True, conn=conn)
+        if resp is None:
+            _validate_print_fail("Trakt", "authed ping failed (no valid token / API error)")
+            results["required_fail"] = True
+            return
+        _validate_print_ok("Trakt", f"token valid ({days_left} days until expiry)")
+    except Exception as e:
+        _validate_print_fail("Trakt", f"{type(e).__name__}: {e}")
+        results["required_fail"] = True
+
+
+def _probe_tmdb(results):
+    """Optional. Skipped unless TMDB_API_KEY is set."""
+    if not TMDB_API_KEY:
+        results["optional_unset"].append("TMDB")
+        return
+    try:
+        data = tmdb_get("/configuration")
+        if data is None:
+            _validate_print_fail("TMDB", "request failed (bad key / API error)")
+            return
+        _validate_print_ok("TMDB", "API key accepted")
+    except Exception as e:
+        _validate_print_fail("TMDB", f"{type(e).__name__}: {e}")
+
+
+def _probe_seerr(results):
+    """Optional."""
+    if not (SEERR_URL and SEERR_API_KEY):
+        results["optional_unset"].append("Seerr")
+        return
+    try:
+        data = seerr_get("/status")
+        if data is None:
+            _validate_print_fail("Seerr", f"request failed at {SEERR_URL}")
+            return
+        version = data.get("version", "?") if isinstance(data, dict) else "?"
+        _validate_print_ok("Seerr", f"reachable (version {version})")
+    except Exception as e:
+        _validate_print_fail("Seerr", f"{type(e).__name__}: {e}")
+
+
+def _probe_sonarr(results):
+    """Required. GET /system/status using a minimal local helper."""
+    if not (SONARR_URL and SONARR_API_KEY):
+        _validate_print_fail("Sonarr", "SONARR_URL / SONARR_API_KEY not set (required)")
+        results["required_fail"] = True
+        return
+    try:
+        headers = {"X-Api-Key": SONARR_API_KEY, "Content-Type": "application/json"}
+        data = _api_request_with_retry(
+            requests.get, f"{SONARR_URL}/api/v3/system/status", headers, max_retries=1
+        )
+        if data is None:
+            _validate_print_fail("Sonarr", f"request failed at {SONARR_URL}")
+            results["required_fail"] = True
+            return
+        _validate_print_ok("Sonarr", f"reachable (version {data.get('version', '?')})")
+    except Exception as e:
+        _validate_print_fail("Sonarr", f"{type(e).__name__}: {e}")
+        results["required_fail"] = True
+
+
+def _probe_jellyfin(results):
+    """Required. GET /System/Info, then validate each JELLYFIN_USER_IDS entry."""
+    if not (JELLYFIN_URL and JELLYFIN_API_KEY):
+        _validate_print_fail("Jellyfin", "JELLYFIN_URL / JELLYFIN_API_KEY not set (required)")
+        results["required_fail"] = True
+        return
+    headers = {"X-Emby-Token": JELLYFIN_API_KEY, "Content-Type": "application/json"}
+    try:
+        data = _api_request_with_retry(
+            requests.get, f"{JELLYFIN_URL}/System/Info", headers, max_retries=1
+        )
+        if data is None:
+            _validate_print_fail("Jellyfin", f"server unreachable at {JELLYFIN_URL}")
+            results["required_fail"] = True
+            return
+        _validate_print_ok("Jellyfin", f"server reachable (version {data.get('Version', '?')})")
+    except Exception as e:
+        _validate_print_fail("Jellyfin", f"{type(e).__name__}: {e}")
+        results["required_fail"] = True
+        return
+
+    # Resolve each configured user ID. A non-UUID value (e.g. a display name) is
+    # the known prior failure mode — flag it loudly before hitting the API.
+    if not JELLYFIN_USER_IDS:
+        _validate_print_fail("Jellyfin users", "JELLYFIN_USER_IDS is empty")
+        results["required_fail"] = True
+        return
+    for uid in JELLYFIN_USER_IDS:
+        if not _UUID_RE.match(uid):
+            _validate_print_fail(
+                f"Jellyfin user '{uid}'",
+                "not a UUID — Jellyfin needs the user UUID, not the display name",
+            )
+            results["required_fail"] = True
+            continue
+        try:
+            udata = _api_request_with_retry(
+                requests.get, f"{JELLYFIN_URL}/Users/{uid}", headers, max_retries=1
+            )
+            if udata is None:
+                _validate_print_fail(f"Jellyfin user '{uid}'", "lookup failed")
+                results["required_fail"] = True
+                continue
+            name = udata.get("Name", "?")
+            _validate_print_ok(f"Jellyfin user '{uid}'", f"resolved to '{name}'")
+        except Exception as e:
+            _validate_print_fail(f"Jellyfin user '{uid}'", f"{type(e).__name__}: {e}")
+            results["required_fail"] = True
+
+
+def _probe_sabnzbd(results):
+    """Optional. version ping."""
+    if not (SABNZBD_URL and SABNZBD_API_KEY):
+        results["optional_unset"].append("SABnzbd")
+        return
+    try:
+        params = {"apikey": SABNZBD_API_KEY, "mode": "version", "output": "json"}
+        data = _api_request_with_retry(
+            requests.get, f"{SABNZBD_URL}/api", {}, max_retries=1, params=params
+        )
+        if data is None:
+            _validate_print_fail("SABnzbd", f"request failed at {SABNZBD_URL}")
+            return
+        version = data.get("version", "?") if isinstance(data, dict) else "?"
+        _validate_print_ok("SABnzbd", f"reachable (version {version})")
+    except Exception as e:
+        _validate_print_fail("SABnzbd", f"{type(e).__name__}: {e}")
+
+
+def _probe_alerts(conn, results, send=False):
+    """Optional. Report configured channels; with --send, fire a test message."""
+    configured = []
+    if ALERT_WEBHOOK_URL:
+        configured.append("webhook")
+    if SMTP_HOST and ALERT_EMAIL_TO and ALERT_EMAIL_FROM:
+        configured.append(f"email→{ALERT_EMAIL_TO}")
+    if not configured:
+        results["optional_unset"].append("Alerts")
+        return
+    if send:
+        try:
+            if cmd_test_alert(conn):
+                _validate_print_ok("Alerts", f"test message sent to: {', '.join(configured)}")
+            else:
+                _validate_print_fail("Alerts", "no channels configured")
+        except Exception as e:
+            _validate_print_fail("Alerts", f"{type(e).__name__}: {e}")
+    else:
+        _validate_print_ok(
+            "Alerts", f"configured: {', '.join(configured)} (use --send to test delivery)"
+        )
+
+
+def cmd_validate(conn, send=False):
+    """Probe every configured integration and report ✓/✗ for each.
+
+    Required services (Trakt, Sonarr, Jellyfin) failing → exit 1. Only-optional
+    services unset → exit 0 with an informational note. Each probe catches its
+    own exceptions so one failure never aborts the rest.
+    """
+    results = {"required_fail": False, "optional_unset": []}
+
+    print("Validating integrations...\n")
+    _probe_trakt(conn, results)
+    _probe_tmdb(results)
+    _probe_seerr(results)
+    _probe_sonarr(results)
+    _probe_jellyfin(results)
+    _probe_sabnzbd(results)
+    _probe_alerts(conn, results, send=send)
+
+    if results["optional_unset"]:
+        print(
+            f"\nInfo: optional integrations not configured (skipped): "
+            f"{', '.join(results['optional_unset'])}"
+        )
+
+    if results["required_fail"]:
+        print("\nValidation FAILED — one or more required services (Trakt, Sonarr, Jellyfin) failed.")
+        return False
+    print("\nValidation OK — all required services reachable.")
+    return True
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -1875,9 +2107,14 @@ def main():
         elif command == "test-alert":
             success = cmd_test_alert(conn)
             sys.exit(0 if success else 1)
+        elif command == "validate":
+            send = "--send" in sys.argv[2:]
+            success = cmd_validate(conn, send=send)
+            sys.exit(0 if success else 1)
         else:
             print(f"Unknown command: {command}")
-            print("Usage: python trakt_discovery.py [auth|reauth|discover|status|reset|test-alert]")
+            print("Usage: python trakt_discovery.py [auth|reauth|discover|status|reset|test-alert|validate]")
+            print("       validate [--send]   (--send fires a real test alert)")
             sys.exit(1)
     finally:
         conn.close()

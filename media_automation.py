@@ -76,6 +76,12 @@ SABNZBD_URL = os.getenv("SABNZBD_URL", "")
 SABNZBD_API_KEY = os.getenv("SABNZBD_API_KEY", "")
 SABNZBD_QUEUE_WAIT_SECONDS = get_int_env("SABNZBD_QUEUE_WAIT_SECONDS", 120)
 
+# Phase 1: in-progress weekly priority boost. A season the user is actively
+# working through (>=1 episode played, most-recent play within this many days)
+# gets its still-queued episodes bumped to High priority so the next episode
+# lands before the user catches up. 0/negative effectively disables the boost.
+INPROGRESS_BOOST_WINDOW_DAYS = get_int_env("INPROGRESS_BOOST_WINDOW_DAYS", 7)
+
 # Database path for tracking what we've already processed
 DB_PATH = os.getenv("DB_PATH", "/data/media_automation.db")
 
@@ -425,6 +431,20 @@ def init_db():
                     season_number INTEGER,
                     boosted_at TEXT,
                     PRIMARY KEY (sonarr_id, season_number)
+                )
+            """)
+            # ---- episode_boosts ledger (Phase 1: in-progress weekly boost) -------
+            # Per-episode boost ledger, distinct from the season-level priority_boosts
+            # table. Records that an individual queued episode of an in-progress
+            # season has already been bumped to High priority so a later cycle does
+            # not re-boost (and re-log) the same nzo.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS episode_boosts (
+                    sonarr_id INTEGER,
+                    season_number INTEGER,
+                    episode_number INTEGER,
+                    boosted_at TEXT,
+                    PRIMARY KEY (sonarr_id, season_number, episode_number)
                 )
             """)
             conn.commit()
@@ -1051,6 +1071,44 @@ def _index_series_by_tvdb(series_by_tvdb, s):
     series_by_tvdb[tvdb_id] = s
 
 
+def _resolve_sonarr_series(series_name, series_jf_id, user_id, series_by_title, series_by_tvdb):
+    """Match a Jellyfin series to its Sonarr record by title, then TVDB id.
+
+    Shared by the watch-progress cascade and the in-progress boost so both apply
+    the same (intentionally conservative) matching: exact case-insensitive title
+    first, falling back to a Jellyfin ProviderIds TVDB lookup. Returns the Sonarr
+    series dict or None.
+    """
+    sonarr_series = None
+    title_lower = series_name.lower().strip()
+
+    match = series_by_title.get(title_lower)
+    if match:
+        if isinstance(match, list):
+            for candidate in match:
+                if candidate["title"].lower().strip() == title_lower:
+                    sonarr_series = candidate
+                    break
+            if not sonarr_series:
+                sonarr_series = match[0]
+        else:
+            if match["title"].lower().strip() == title_lower:
+                sonarr_series = match
+
+    if not sonarr_series:
+        try:
+            jf_series_data = jellyfin_get(f"/Users/{user_id}/Items/{series_jf_id}")
+            tvdb_id = jf_series_data.get("ProviderIds", {}).get("Tvdb")
+            if tvdb_id:
+                sonarr_series = series_by_tvdb.get(int(tvdb_id))
+                if sonarr_series:
+                    log.debug(f"  Matched '{series_name}' via TVDB ID {tvdb_id}")
+        except Exception as e:
+            log.debug(f"  Could not get provider IDs for {series_name}: {e}")
+
+    return sonarr_series
+
+
 # ============================================================
 # TASK 2: Monitor watch progress and unlock next seasons
 # ============================================================
@@ -1098,7 +1156,7 @@ def check_user_progress(conn, user_id, series_by_title, series_by_tvdb, all_seri
             "IncludeItemTypes": "Episode",
             "Recursive": "true",
             "IsPlayed": "true",
-            "Fields": "SeriesName,ParentIndexNumber,IndexNumber,ProviderIds",
+            "Fields": "SeriesName,ParentIndexNumber,IndexNumber,ProviderIds,UserData",
             "Limit": "10000"
         })
     except Exception as e:
@@ -1131,32 +1189,8 @@ def check_user_progress(conn, user_id, series_by_title, series_by_tvdb, all_seri
     for series_jf_id, progress_data in series_progress.items():
         series_name = progress_data["name"]
 
-        sonarr_series = None
-        title_lower = series_name.lower().strip()
-
-        match = series_by_title.get(title_lower)
-        if match:
-            if isinstance(match, list):
-                for candidate in match:
-                    if candidate["title"].lower().strip() == title_lower:
-                        sonarr_series = candidate
-                        break
-                if not sonarr_series:
-                    sonarr_series = match[0]
-            else:
-                if match["title"].lower().strip() == title_lower:
-                    sonarr_series = match
-
-        if not sonarr_series:
-            try:
-                jf_series_data = jellyfin_get(f"/Users/{user_id}/Items/{series_jf_id}")
-                tvdb_id = jf_series_data.get("ProviderIds", {}).get("Tvdb")
-                if tvdb_id:
-                    sonarr_series = series_by_tvdb.get(int(tvdb_id))
-                    if sonarr_series:
-                        log.debug(f"  Matched '{series_name}' via TVDB ID {tvdb_id}")
-            except Exception as e:
-                log.debug(f"  Could not get provider IDs for {series_name}: {e}")
+        sonarr_series = _resolve_sonarr_series(
+            series_name, series_jf_id, user_id, series_by_title, series_by_tvdb)
 
         if not sonarr_series:
             log.debug(f"  '{series_name}' not found in Sonarr")
@@ -1346,6 +1380,30 @@ def mark_season_boosted(conn, sonarr_id, season_number):
         pass
 
 
+def is_episode_boosted(conn, sonarr_id, season_number, episode_number):
+    """Check if a single episode has already had its priority boosted."""
+    c = conn.cursor()
+    c.execute(
+        "SELECT 1 FROM episode_boosts WHERE sonarr_id = ? AND season_number = ? AND episode_number = ?",
+        (sonarr_id, season_number, episode_number)
+    )
+    return c.fetchone() is not None
+
+
+def mark_episode_boosted(conn, sonarr_id, season_number, episode_number):
+    """Record that a single episode's download has been priority boosted."""
+    try:
+        with conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO episode_boosts "
+                "(sonarr_id, season_number, episode_number, boosted_at) VALUES (?, ?, ?, ?)",
+                (sonarr_id, season_number, episode_number, datetime.now(timezone.utc).isoformat())
+            )
+    except sqlite3.IntegrityError:
+        pass
+
+
 def boost_season_priority(conn, series_id, season_number, title, force_e02=False, max_retries=3,
                           session=None, stop_event=None):
     """Boost SABnzbd download priority for a season's queued episodes.
@@ -1486,6 +1544,225 @@ def boost_season_priority(conn, series_id, season_number, title, force_e02=False
 
     # If we got here, we never found items to boost
     log.info(f"  No items appeared in SABnzbd queue for {title} S{season_number:02d} after {max_retries} attempts")
+
+
+def _parse_jf_datetime(value):
+    """Parse a Jellyfin ISO timestamp into an aware UTC datetime, or None.
+
+    Jellyfin returns timestamps like '2026-06-15T20:11:33.0000000Z'. Python's
+    fromisoformat rejects the trailing 'Z' (pre-3.11) and 7-digit fractional
+    seconds, so normalize both before parsing.
+    """
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # Trim over-long fractional seconds (Jellyfin emits 7 digits; Python wants <=6).
+    if "." in s:
+        head, _, tail = s.partition(".")
+        frac = tail
+        tz = ""
+        for marker in ("+", "-"):
+            idx = tail.find(marker)
+            if idx != -1:
+                frac, tz = tail[:idx], tail[idx:]
+                break
+        frac = frac[:6]
+        s = f"{head}.{frac}{tz}"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def boost_in_progress_episodes(conn):
+    """Weekly in-progress boost (Phase 1).
+
+    For each season a user is actively working through — at least one played
+    episode, most-recent play within INPROGRESS_BOOST_WINDOW_DAYS — that is
+    already unlocked/in-progress (is_season_unlocked True) but has NOT yet
+    triggered its next-season unlock, bump that season's still-queued episodes
+    to High priority so the next episode lands before the user catches up.
+
+    This is independent of boost_season_priority / the priority_boosts table: it
+    uses the per-episode episode_boosts ledger so each queued nzo is boosted (and
+    logged) exactly once. No-op when SABnzbd is unconfigured or the window is
+    disabled (<= 0). Honors DRY_RUN.
+    """
+    if not SABNZBD_API_KEY:
+        log.debug("In-progress boost: SABnzbd not configured, skipping")
+        return
+
+    if INPROGRESS_BOOST_WINDOW_DAYS <= 0:
+        log.debug("In-progress boost: INPROGRESS_BOOST_WINDOW_DAYS <= 0, disabled")
+        return
+
+    log.info("=== In-progress episode priority boost ===")
+
+    all_series = sonarr_get("/series")
+    if not isinstance(all_series, list):
+        log.warning("Sonarr /series returned no usable list; skipping in-progress boost this cycle")
+        return
+
+    series_by_title = {}
+    series_by_tvdb = {}
+    for s in all_series:
+        title_lower = s["title"].lower().strip()
+        if title_lower not in series_by_title:
+            series_by_title[title_lower] = s
+        else:
+            existing = series_by_title[title_lower]
+            if isinstance(existing, list):
+                existing.append(s)
+            else:
+                series_by_title[title_lower] = [existing, s]
+        _index_series_by_tvdb(series_by_tvdb, s)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=INPROGRESS_BOOST_WINDOW_DAYS)
+
+    for user_id in JELLYFIN_USER_IDS:
+        _boost_in_progress_for_user(conn, user_id, series_by_title, series_by_tvdb, cutoff)
+
+
+def _boost_in_progress_for_user(conn, user_id, series_by_title, series_by_tvdb, cutoff):
+    """In-progress boost for a single Jellyfin user (see boost_in_progress_episodes)."""
+    try:
+        watched_data = jellyfin_get(f"/Users/{user_id}/Items", params={
+            "IncludeItemTypes": "Episode",
+            "Recursive": "true",
+            "IsPlayed": "true",
+            "Fields": "SeriesName,ParentIndexNumber,IndexNumber,ProviderIds,UserData",
+            "Limit": "10000"
+        })
+    except Exception as e:
+        log.warning(f"In-progress boost: could not get watched episodes for {user_id}: {e}")
+        return
+
+    watched_items = (watched_data or {}).get("Items", [])
+    if not watched_items:
+        return
+
+    # Aggregate per (series_jf_id, season): play count + most-recent play time.
+    series_progress = {}
+    for item in watched_items:
+        series_name = item.get("SeriesName", "")
+        series_jf_id = item.get("SeriesId", "")
+        season_num = item.get("ParentIndexNumber", 0)
+
+        if not series_name or not series_jf_id or season_num == 0:
+            continue
+
+        entry = series_progress.setdefault(series_jf_id, {"name": series_name, "last_played": {}})
+        last_played = entry["last_played"]
+
+        played_at = _parse_jf_datetime((item.get("UserData") or {}).get("LastPlayedDate"))
+        if played_at is not None:
+            prev = last_played.get(season_num)
+            if prev is None or played_at > prev:
+                last_played[season_num] = played_at
+
+    for series_jf_id, progress_data in series_progress.items():
+        series_name = progress_data["name"]
+        sonarr_series = _resolve_sonarr_series(
+            series_name, series_jf_id, user_id, series_by_title, series_by_tvdb)
+        if not sonarr_series:
+            log.debug(f"  In-progress boost: '{series_name}' not found in Sonarr")
+            continue
+
+        sonarr_id = sonarr_series["id"]
+
+        for season_num, played_at in progress_data["last_played"].items():
+            # Only seasons whose most-recent play is recent enough.
+            if played_at < cutoff:
+                continue
+
+            # The current season must be unlocked/in-progress...
+            if not is_season_unlocked(conn, sonarr_id, season_num):
+                continue
+
+            # ...and must not have already cascaded into the next season (that's
+            # the season-unlock path's job, handled by boost_season_priority).
+            if is_season_unlocked(conn, sonarr_id, season_num + 1):
+                continue
+
+            _boost_in_progress_season(conn, sonarr_id, season_num, series_name)
+
+
+def _boost_in_progress_season(conn, sonarr_id, season_number, title):
+    """Bump still-queued, not-yet-boosted episodes of one in-progress season.
+
+    Mirrors the Sonarr-queue -> SABnzbd nzo matching of boost_season_priority but
+    is single-pass (no wait/retry) and dedupes per episode via episode_boosts.
+    """
+    try:
+        episodes = sonarr_get(f"/episode?seriesId={sonarr_id}")
+    except Exception as e:
+        log.warning(f"  In-progress boost: failed to get episodes for {title}: {e}")
+        return
+
+    if not isinstance(episodes, list):
+        return
+
+    ep_number_map = {}
+    for ep in episodes:
+        if ep.get("seasonNumber") == season_number:
+            ep_number_map[ep["id"]] = ep.get("episodeNumber", 0)
+
+    if not ep_number_map:
+        return
+
+    try:
+        sonarr_queue = sonarr_get("/queue?page=1&pageSize=200&includeUnknownSeriesItems=false")
+    except Exception as e:
+        log.warning(f"  In-progress boost: failed to get Sonarr queue for {title}: {e}")
+        return
+
+    if not sonarr_queue:
+        return
+
+    # download_id -> episode_number for this series/season's queued items.
+    download_ids = {}
+    for queue_item in sonarr_queue.get("records", []):
+        if queue_item.get("seriesId") != sonarr_id:
+            continue
+        ep_id = queue_item.get("episodeId")
+        if ep_id not in ep_number_map:
+            continue
+        dl_id = queue_item.get("downloadId")
+        if dl_id:
+            download_ids[dl_id] = ep_number_map[ep_id]
+
+    if not download_ids:
+        return
+
+    sab_slots = sabnzbd_get_queue()
+    for slot in sab_slots:
+        nzo_id = slot.get("nzo_id", "")
+        if nzo_id not in download_ids:
+            continue
+
+        ep_num = download_ids[nzo_id]
+
+        if is_episode_boosted(conn, sonarr_id, season_number, ep_num):
+            log.debug(f"  {title} S{season_number:02d}E{ep_num:02d} already in-progress boosted, skipping")
+            continue
+
+        if DRY_RUN:
+            log.info(f"  [DRY RUN] Would set {title} S{season_number:02d}E{ep_num:02d} "
+                     f"to High priority (in-progress boost)")
+            continue
+
+        if sabnzbd_set_priority(nzo_id, 1):
+            log.info(f"  Set {title} S{season_number:02d}E{ep_num:02d} "
+                     f"to High priority (in-progress boost)")
+            mark_episode_boosted(conn, sonarr_id, season_number, ep_num)
+        else:
+            log.warning(f"  In-progress boost: failed to set priority for "
+                        f"{title} S{season_number:02d}E{ep_num:02d}")
 
 
 # ============================================================
@@ -1722,6 +1999,7 @@ def run_once():
             return
         set_initial_monitoring(conn)
         check_watch_progress(conn)
+        boost_in_progress_episodes(conn)
         cleanup_stale_db_entries(conn)
     except Exception as e:
         log.error(f"Error during automation run: {e}", exc_info=True)
