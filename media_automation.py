@@ -47,6 +47,15 @@ def get_int_env(key, default):
 SONARR_URL = os.getenv("SONARR_URL", "")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 
+# Radarr (movies). No client existed before Phase 3; mirrors the Sonarr config.
+RADARR_URL = os.getenv("RADARR_URL", "")
+RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
+
+# Phase 3: auto-resolve "matched by ID" import blocks in Sonarr/Radarr. Master
+# toggle; default on whenever the relevant *_API_KEY is configured. Set to
+# "false" to disable even when keys are present.
+AUTO_IMPORT_BLOCKED = os.getenv("AUTO_IMPORT_BLOCKED", "true").lower() == "true"
+
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 
@@ -92,6 +101,7 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 # API HELPERS
 # ============================================================
 SONARR_HEADERS = {"X-Api-Key": SONARR_API_KEY, "Content-Type": "application/json"}
+RADARR_HEADERS = {"X-Api-Key": RADARR_API_KEY, "Content-Type": "application/json"}
 JELLYFIN_HEADERS = {"X-Emby-Token": JELLYFIN_API_KEY, "Content-Type": "application/json"}
 SEERR_HEADERS = {"X-Api-Key": SEERR_API_KEY, "Content-Type": "application/json"}
 
@@ -206,6 +216,16 @@ def sonarr_put(endpoint, data, session=None):
 def sonarr_post(endpoint, data, session=None):
     """POST request to Sonarr API."""
     return _api_request_with_retry(requests.post, f"{SONARR_URL}/api/v3{endpoint}", SONARR_HEADERS, session=session, json=data)
+
+
+def radarr_get(endpoint, session=None):
+    """GET request to Radarr API."""
+    return _api_request_with_retry(requests.get, f"{RADARR_URL}/api/v3{endpoint}", RADARR_HEADERS, session=session)
+
+
+def radarr_post(endpoint, data, session=None):
+    """POST request to Radarr API."""
+    return _api_request_with_retry(requests.post, f"{RADARR_URL}/api/v3{endpoint}", RADARR_HEADERS, session=session, json=data)
 
 
 def sonarr_delete(endpoint):
@@ -1048,6 +1068,230 @@ def cleanup_unwanted_queue_items(series_id, title):
         log.info(f"  Cancelled {cancelled} unwanted downloads for {title}")
 
     return cancelled
+
+
+# ============================================================
+# PHASE 3: auto-resolve "matched by ID" import blocks
+# ============================================================
+# When a completed download's release name doesn't self-parse to a library
+# title (e.g. "Battlestar.Galactica.2005.S02E01" vs "Battlestar Galactica
+# (2003)"), Sonarr/Radarr match it only via grab-history ID and then refuse to
+# auto-import as a safety measure. The queue item sits in importBlocked/
+# importPending with a status message like "...matched to series by ID.
+# Automatic import is not possible. ... Manual Import required." We detect that
+# specific signature, pull the resolved candidate via /manualimport, and fire a
+# ManualImport command to clear it. We deliberately ignore genuinely-unparseable
+# junk ("No files are eligible for import") and benign quality rejections
+# ("Not a Custom Format upgrade").
+
+# Tracked-download states that indicate the item is held pending a manual
+# import decision (i.e. a real import block, not still downloading).
+_IMPORT_BLOCKED_STATES = {"importblocked", "importpending"}
+
+
+def _is_matched_by_id_block(record):
+    """True iff a queue record is a "matched by ID" import block we should auto-clear.
+
+    Conservative on purpose: requires both an import-block tracked state AND a
+    status message that carries the distinctive by-ID signature. The two benign
+    cases the spec calls out -- season-pack "No files are eligible for import"
+    and quality "Not a Custom Format upgrade" rejections -- must NOT match.
+    """
+    state = str(record.get("trackedDownloadState", "")).strip().lower()
+    if state not in _IMPORT_BLOCKED_STATES:
+        return False
+
+    # Gather every status message string attached to the record.
+    messages = []
+    for sm in record.get("statusMessages", []) or []:
+        title = sm.get("title")
+        if title:
+            messages.append(str(title))
+        for m in sm.get("messages", []) or []:
+            if m:
+                messages.append(str(m))
+    blob = " ".join(messages).lower()
+    if not blob:
+        return False
+
+    # by-ID signature: "matched ... by ID" (Sonarr/Radarr phrasing) and/or the
+    # "Manual Import required" follow-up. Require the distinctive by-ID phrase so
+    # we don't fire on unrelated manual-import nudges.
+    matched_by_id = "matched" in blob and "by id" in blob
+    if not matched_by_id:
+        return False
+
+    # Explicitly steer clear of the benign cases even if some future message
+    # ever combined them with by-ID text.
+    if "no files are eligible for import" in blob:
+        return False
+    if "not a custom format upgrade" in blob:
+        return False
+
+    return True
+
+
+def _build_sonarr_import_file(candidate, download_id):
+    """Map a Sonarr /manualimport candidate row to a ManualImport `files` entry.
+
+    Carries through the resolved seriesId/episodeIds/quality the manualimport
+    response already worked out for us. Returns None if the candidate didn't
+    resolve to a series + at least one episode (nothing safe to import).
+    """
+    series = candidate.get("series") or {}
+    series_id = series.get("id") or candidate.get("seriesId")
+    episode_ids = [e["id"] for e in (candidate.get("episodes") or []) if e.get("id")]
+    if not series_id or not episode_ids:
+        return None
+
+    entry = {
+        "path": candidate.get("path"),
+        "seriesId": series_id,
+        "episodeIds": episode_ids,
+        "quality": candidate.get("quality"),
+        "languages": candidate.get("languages"),
+        "releaseGroup": candidate.get("releaseGroup"),
+        "downloadId": download_id,
+    }
+    # Carry through optional fields only when present (mirrors the UI payload).
+    if candidate.get("customFormats") is not None:
+        entry["customFormats"] = candidate.get("customFormats")
+    if candidate.get("indexerFlags") is not None:
+        entry["indexerFlags"] = candidate.get("indexerFlags")
+    return entry
+
+
+def _build_radarr_import_file(candidate, download_id):
+    """Map a Radarr /manualimport candidate row to a ManualImport `files` entry.
+
+    Radarr uses movieId instead of seriesId/episodeIds. Returns None if the
+    candidate didn't resolve to a movie.
+    """
+    movie = candidate.get("movie") or {}
+    movie_id = movie.get("id") or candidate.get("movieId")
+    if not movie_id:
+        return None
+
+    entry = {
+        "path": candidate.get("path"),
+        "movieId": movie_id,
+        "quality": candidate.get("quality"),
+        "languages": candidate.get("languages"),
+        "releaseGroup": candidate.get("releaseGroup"),
+        "downloadId": download_id,
+    }
+    if candidate.get("customFormats") is not None:
+        entry["customFormats"] = candidate.get("customFormats")
+    if candidate.get("indexerFlags") is not None:
+        entry["indexerFlags"] = candidate.get("indexerFlags")
+    return entry
+
+
+def _resolve_blocked_imports(label, get_fn, post_fn, build_file_fn):
+    """Shared blocked-queue -> manualimport -> ManualImport flow.
+
+    `label` is "Sonarr"/"Radarr" for logs; get_fn/post_fn are the *arr clients;
+    build_file_fn maps a manualimport candidate to a ManualImport `files` entry.
+    Returns the number of import commands fired (0 in DRY_RUN). Pages the queue
+    with the same pattern as cleanup_unwanted_queue_items.
+    """
+    resolved = 0
+    page = 1
+    page_size = 100
+
+    while True:
+        try:
+            queue_data = get_fn(
+                f"/queue?page={page}&pageSize={page_size}&includeUnknownSeriesItems=false")
+        except Exception as e:
+            log.warning(f"  [{label}] Failed to get queue page {page}: {e}")
+            break
+
+        if not queue_data:
+            break
+
+        records = queue_data.get("records", [])
+        if not records:
+            break
+
+        for record in records:
+            if not _is_matched_by_id_block(record):
+                continue
+
+            download_id = record.get("downloadId")
+            title = record.get("title", "?")
+            if not download_id:
+                log.warning(f"  [{label}] by-ID block '{title}' has no downloadId; skipping")
+                continue
+
+            if DRY_RUN:
+                log.info(f"  [{label}] DRY RUN: would import by-ID block '{title}' (downloadId={download_id})")
+                continue
+
+            try:
+                candidates = get_fn(f"/manualimport?downloadId={download_id}")
+            except Exception as e:
+                log.warning(f"  [{label}] manualimport lookup failed for '{title}': {e}")
+                continue
+
+            if not isinstance(candidates, list) or not candidates:
+                log.warning(f"  [{label}] no manualimport candidates for '{title}'; skipping")
+                continue
+
+            files = []
+            for cand in candidates:
+                entry = build_file_fn(cand, download_id)
+                if entry:
+                    files.append(entry)
+
+            if not files:
+                log.warning(f"  [{label}] '{title}' did not resolve to importable files; skipping")
+                continue
+
+            try:
+                post_fn("/command", {"name": "ManualImport", "files": files, "importMode": "auto"})
+                resolved += 1
+                log.info(f"  [{label}] Auto-imported by-ID block '{title}' ({len(files)} file(s))")
+            except Exception as e:
+                log.warning(f"  [{label}] ManualImport command failed for '{title}': {e}")
+
+        total_records = queue_data.get("totalRecords", 0)
+        if page * page_size >= total_records:
+            break
+
+        page += 1
+
+    return resolved
+
+
+def resolve_blocked_imports():
+    """Auto-resolve Sonarr "matched by ID" import blocks. Returns count resolved."""
+    return _resolve_blocked_imports("Sonarr", sonarr_get, sonarr_post, _build_sonarr_import_file)
+
+
+def resolve_blocked_imports_radarr():
+    """Auto-resolve Radarr "matched by ID" import blocks. Returns count resolved."""
+    return _resolve_blocked_imports("Radarr", radarr_get, radarr_post, _build_radarr_import_file)
+
+
+def resolve_all_blocked_imports():
+    """Run both *arr blocked-import resolvers, each gated on its API key and the
+    AUTO_IMPORT_BLOCKED master toggle. Each call is wrapped so a failure in one
+    can't abort the cycle."""
+    if not AUTO_IMPORT_BLOCKED:
+        return
+
+    if SONARR_API_KEY:
+        try:
+            resolve_blocked_imports()
+        except Exception as e:
+            log.error(f"Sonarr blocked-import resolution failed: {e}", exc_info=True)
+
+    if RADARR_API_KEY:
+        try:
+            resolve_blocked_imports_radarr()
+        except Exception as e:
+            log.error(f"Radarr blocked-import resolution failed: {e}", exc_info=True)
 
 
 def _index_series_by_tvdb(series_by_tvdb, s):
@@ -2000,6 +2244,7 @@ def run_once():
         set_initial_monitoring(conn)
         check_watch_progress(conn)
         boost_in_progress_episodes(conn)
+        resolve_all_blocked_imports()
         cleanup_stale_db_entries(conn)
     except Exception as e:
         log.error(f"Error during automation run: {e}", exc_info=True)
