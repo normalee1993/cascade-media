@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.8.1] - 2026-06-18
+
+Cascade unlock correctness fixes (caught in production logs) plus validator/docs/deploy finishing touches.
+
+### Fixed
+- **Watching a single preview episode no longer unlocks the *next* season.** `check_watch_progress` computed a season's watched % using the number of episodes Jellyfin could see — i.e. only the **downloaded** ones. For a preview-only season that's just the E01 preview, so watching it read as `1/1 = 100%` and tripped the 75% next-season unlock. (Live example: *For All Mankind* S04's preview was watched and S05 was wrongly unlocked + grabbed.) The denominator is now the count of **aired** episodes for that season from Sonarr (`airDateUtc <= now`), so the same watch reads as `1/10 = 10%` and the next season stays locked. If Sonarr's episode list is unavailable, unlocks are skipped for that series this cycle rather than falling back to the buggy count.
+- **Watching a preview E01 now unlocks the *rest of that season* via watch history, not just live playback.** The documented "play a preview E01 → unlock that whole season" behavior previously only fired from the active-playback path (a currently-playing session). If the play had already finished (or wasn't caught live), the season's remaining episodes never downloaded. The watch-progress path now also unlocks a still-locked season when its E01 is marked watched.
+
+### Added
+- **Radarr in the `validate` command** — `validate` now probes Radarr (`/api/v3/system/status`) alongside the other services. Optional: skipped when `RADARR_URL`/`RADARR_API_KEY` are blank.
+- **`update.sh`** deploy helper (repo root) — `git pull` + `docker compose pull` + `up -d --force-recreate` + image prune in one command, so on-disk files (`.env.example`, README, docs) stay in sync with the image. `docker compose pull` alone only updates the image.
+- **README** now documents `validate`, the in-progress weekly boost (`INPROGRESS_BOOST_WINDOW_DAYS`), matched-by-ID auto-import (`RADARR_*`, `AUTO_IMPORT_BLOCKED`), `test-alert --verify`, and an "Update to Latest Version" section.
+
+### Changed (internal)
+- The three season-unlock sites (next-season, current-season, active-playback) now share one `unlock_and_download_season()` helper — identical monitor → SeasonSearch → mark-unlocked → boost behavior, including the interruptible shutdown wait.
+
+### Notes
+- SemVer: PATCH — primarily bug fixes; the Radarr probe / `update.sh` / README additions are small and backward-compatible.
+- 198 unit tests pass (15 new).
+
 ## [v1.8.0] - 2026-06-18
 
 Tier 2 backlog: operational auto-recovery and alert verification.
@@ -225,6 +245,7 @@ Initial public release.
 - **Docker image** published to GHCR (`ghcr.io/normalee1993/cascade-media`).
 - **Unraid Community Applications template** in `templates/cascade-media.xml`.
 
+[v1.8.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.8.1
 [v1.8.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.8.0
 [v1.7.0]: https://github.com/normalee1993/cascade-media/releases/tag/v1.7.0
 [v1.6.1]: https://github.com/normalee1993/cascade-media/releases/tag/v1.6.1
