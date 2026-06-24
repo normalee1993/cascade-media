@@ -1353,6 +1353,61 @@ def _resolve_sonarr_series(series_name, series_jf_id, user_id, series_by_title, 
     return sonarr_series
 
 
+def unlock_and_download_season(conn, sonarr_id, season_number, series_name, unlocked_by,
+                               sonarr_episodes, force_e02, session=None, stop_event=None):
+    """Monitor + search + mark + (interruptible) wait + boost for one season.
+
+    Shared by all three unlock sites (next-season cascade, watched-E01 current
+    season, and live-playback E01). `sonarr_episodes` is the already-fetched
+    /episode list for the series so callers fetch it once. Returns True if the
+    season had episodes and was unlocked, False if there were no episodes for it.
+
+    The ~120s SABnzbd-queue wait is interruptible when stop_event is provided
+    (in-process scheduler thread) and a plain blocking sleep otherwise (CLI).
+    """
+    season_episodes = [e for e in sonarr_episodes if e.get("seasonNumber") == season_number]
+
+    if not season_episodes:
+        log.warning(f"  {series_name} Season {season_number} has no episodes in Sonarr")
+        return False
+
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would monitor all {len(season_episodes)} episodes of "
+                 f"{series_name} S{season_number:02d}")
+    else:
+        for ep in season_episodes:
+            if not ep.get("monitored"):
+                ep["monitored"] = True
+                sonarr_put(f"/episode/{ep['id']}", ep, session=session)
+
+        try:
+            sonarr_post("/command", {
+                "name": "SeasonSearch",
+                "seriesId": sonarr_id,
+                "seasonNumber": season_number
+            }, session=session)
+            log.info(f"  Triggered download for {series_name} Season {season_number}")
+        except Exception as e:
+            log.warning(f"  Failed to trigger search: {e}")
+
+    mark_season_unlocked(conn, sonarr_id, season_number, unlocked_by)
+
+    # Wait for downloads to appear in SABnzbd, then boost. Under the scheduler
+    # this wait MUST be interruptible so a SIGTERM doesn't freeze the loop
+    # thread / delay shutdown. stop_event=None → plain blocking sleep (CLI).
+    if not DRY_RUN:
+        log.info(f"  Waiting {SABNZBD_QUEUE_WAIT_SECONDS}s for downloads to appear in SABnzbd...")
+        if stop_event is not None:
+            if stop_event.wait(SABNZBD_QUEUE_WAIT_SECONDS):
+                return True  # shutdown requested — bail out promptly
+        else:
+            time.sleep(SABNZBD_QUEUE_WAIT_SECONDS)
+
+    boost_season_priority(conn, sonarr_id, season_number, series_name, force_e02=force_e02,
+                          session=session, stop_event=stop_event)
+    return True
+
+
 # ============================================================
 # TASK 2: Monitor watch progress and unlock next seasons
 # ============================================================
@@ -1428,7 +1483,11 @@ def check_user_progress(conn, user_id, series_by_title, series_by_tvdb, all_seri
             }
 
         seasons = series_progress[series_jf_id]["seasons"]
-        seasons[season_num] = seasons.get(season_num, 0) + 1
+        if season_num not in seasons:
+            seasons[season_num] = set()
+        ep_index = item.get("IndexNumber")
+        if ep_index is not None:
+            seasons[season_num].add(ep_index)
 
     for series_jf_id, progress_data in series_progress.items():
         series_name = progress_data["name"]
@@ -1442,70 +1501,76 @@ def check_user_progress(conn, user_id, series_by_title, series_by_tvdb, all_seri
 
         sonarr_id = sonarr_series["id"]
 
-        for season_num, watched_count in progress_data["seasons"].items():
+        # Fetch the Sonarr episode list ONCE per series. It drives both the
+        # aired-count denominator (Bug 1) and the actual monitor/search of any
+        # season we unlock. If it isn't a usable list we can't compute aired
+        # counts, so skip all unlocks for this series this cycle rather than
+        # fall back to the Jellyfin (downloaded-only) count (the original bug).
+        sonarr_episodes = sonarr_get(f"/episode?seriesId={sonarr_id}")
+        if not isinstance(sonarr_episodes, list):
+            log.warning(f"  No usable Sonarr episode list for {series_name}; "
+                        f"skipping unlocks this cycle")
+            continue
+
+        now = datetime.now(timezone.utc)
+
+        def _aired_count(season):
+            count = 0
+            for e in sonarr_episodes:
+                if e.get("seasonNumber") != season:
+                    continue
+                ad = e.get("airDateUtc")
+                if not ad:
+                    continue
+                try:
+                    aired = datetime.fromisoformat(ad.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                if aired <= now:
+                    count += 1
+            return count
+
+        for season_num, watched_eps in progress_data["seasons"].items():
+            watched_count = len(watched_eps)
+
+            # Bug 2: watching a preview E01 unlocks THAT season (independent of
+            # the next-season cascade). With Bug 1's aired denominator, watching
+            # only E01 is a low % so the next season won't unlock from it.
+            if 1 in watched_eps and not is_season_unlocked(conn, sonarr_id, season_num):
+                log.info(f"  {user_name} watched E01 of {series_name} S{season_num:02d} "
+                         f"-> Unlocking current Season {season_num}")
+                unlock_and_download_season(
+                    conn, sonarr_id, season_num, series_name,
+                    f"watched-e01:{user_name}", sonarr_episodes, force_e02=True)
+
             next_season = season_num + 1
 
             if is_season_unlocked(conn, sonarr_id, next_season):
                 continue
 
-            try:
-                season_data = jellyfin_get(f"/Shows/{series_jf_id}/Episodes", params={
-                    "UserId": user_id,
-                    "SeasonNumber": season_num
-                })
-                season_items = [
-                    ep for ep in season_data.get("Items", [])
-                    if ep.get("ParentIndexNumber") == season_num
-                ]
-                total_episodes = len(season_items)
-            except Exception as e:
-                log.debug(f"  Could not get season info for {series_name} S{season_num:02d}: {e}")
+            # Bug 1: denominator is AIRED episodes (per Sonarr), not the count of
+            # episodes Jellyfin can see (downloaded). Preview-only seasons would
+            # otherwise read as 100% watched off a single downloaded E01.
+            aired_count = _aired_count(season_num)
+            if aired_count == 0:
                 continue
 
-            if total_episodes == 0:
-                continue
-
-            progress = watched_count / total_episodes
+            progress = watched_count / aired_count
 
             if progress < WATCH_THRESHOLD:
                 continue
 
-            sonarr_episodes = sonarr_get(f"/episode?seriesId={sonarr_id}")
             next_season_episodes = [e for e in sonarr_episodes if e.get("seasonNumber") == next_season]
-
             if not next_season_episodes:
                 log.debug(f"  {series_name} Season {next_season} doesn't exist in Sonarr")
                 continue
 
-            log.info(f"  {user_name} watched {watched_count}/{total_episodes} of {series_name} "
+            log.info(f"  {user_name} watched {watched_count}/{aired_count} of {series_name} "
                      f"S{season_num:02d} ({progress:.0%}) -> Unlocking Season {next_season}")
 
-            if DRY_RUN:
-                log.info(f"  [DRY RUN] Would monitor all {len(next_season_episodes)} episodes of "
-                         f"{series_name} S{next_season:02d}")
-            else:
-                for ep in next_season_episodes:
-                    if not ep.get("monitored"):
-                        ep["monitored"] = True
-                        sonarr_put(f"/episode/{ep['id']}", ep)
-
-                try:
-                    sonarr_post("/command", {
-                        "name": "SeasonSearch",
-                        "seriesId": sonarr_id,
-                        "seasonNumber": next_season
-                    })
-                    log.info(f"  Triggered download for {series_name} Season {next_season}")
-                except Exception as e:
-                    log.warning(f"  Failed to trigger search: {e}")
-
-            mark_season_unlocked(conn, sonarr_id, next_season, user_name)
-
-            # Boost priority in SABnzbd for the newly unlocked season
-            if not DRY_RUN:
-                log.info(f"  Waiting {SABNZBD_QUEUE_WAIT_SECONDS}s for downloads to appear in SABnzbd...")
-                time.sleep(SABNZBD_QUEUE_WAIT_SECONDS)
-            boost_season_priority(conn, sonarr_id, next_season, series_name, force_e02=False)
+            unlock_and_download_season(
+                conn, sonarr_id, next_season, series_name,
+                user_name, sonarr_episodes, force_e02=False)
 
 
 # ============================================================
@@ -2119,44 +2184,16 @@ def check_active_playback(conn, session=None, stop_event=None):
         if not isinstance(sonarr_episodes, list):
             log.warning(f"  No usable episode list for {series_name}; skipping playback unlock this cycle")
             continue
-        season_episodes = [e for e in sonarr_episodes if e.get("seasonNumber") == season_number]
 
-        if not season_episodes:
-            log.warning(f"  {series_name} Season {season_number} has no episodes in Sonarr")
-            continue
+        unlock_and_download_season(
+            conn, sonarr_id, season_number, series_name,
+            f"playback:{user_name}", sonarr_episodes, force_e02=True,
+            session=session, stop_event=stop_event)
 
-        if not DRY_RUN:
-            for ep in season_episodes:
-                if not ep.get("monitored"):
-                    ep["monitored"] = True
-                    sonarr_put(f"/episode/{ep['id']}", ep, session=session)
-
-            try:
-                sonarr_post("/command", {
-                    "name": "SeasonSearch",
-                    "seriesId": sonarr_id,
-                    "seasonNumber": season_number
-                }, session=session)
-                log.info(f"  Triggered search for {series_name} Season {season_number}")
-            except Exception as e:
-                log.warning(f"  Failed to trigger search: {e}")
-
-        mark_season_unlocked(conn, sonarr_id, season_number, f"playback:{user_name}")
-
-        # Wait for downloads to appear in SABnzbd, then boost. This ~120s wait is
-        # the big one — in-process under the scheduler it MUST be interruptible so
-        # a SIGTERM doesn't freeze the loop thread / delay container shutdown. The
-        # standalone CLI passes stop_event=None → plain blocking sleep (unchanged).
-        if not DRY_RUN:
-            log.info(f"  Waiting {SABNZBD_QUEUE_WAIT_SECONDS}s for downloads to appear in SABnzbd...")
-            if stop_event is not None:
-                if stop_event.wait(SABNZBD_QUEUE_WAIT_SECONDS):
-                    return  # shutdown requested — bail out promptly
-            else:
-                time.sleep(SABNZBD_QUEUE_WAIT_SECONDS)
-
-        boost_season_priority(conn, sonarr_id, season_number, series_name, force_e02=True,
-                              session=session, stop_event=stop_event)
+        # Preserve the original "bail out promptly on SIGTERM" semantics: if a
+        # shutdown was requested during the helper's wait, stop the loop now.
+        if stop_event is not None and stop_event.is_set():
+            return
 
 
 # ============================================================
