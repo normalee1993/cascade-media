@@ -46,6 +46,8 @@ def _all_good_env(**overrides):
         "SEERR_API_KEY": "seerr-secret",
         "SONARR_URL": "http://sonarr:8989",
         "SONARR_API_KEY": "sonarr-secret",
+        "RADARR_URL": "http://radarr:7878",
+        "RADARR_API_KEY": "radarr-secret",
         "JELLYFIN_URL": "http://jellyfin:8096",
         "JELLYFIN_API_KEY": "jelly-secret",
         "JELLYFIN_USER_IDS": [VALID_UUID],
@@ -117,7 +119,7 @@ class AllGoodTests(_ProbeHarness):
         self._enter(*self._good_helpers())
         ok, out = _run_validate()
         self.assertTrue(ok)
-        for svc in ("Trakt", "TMDB", "Seerr", "Sonarr", "Jellyfin", "SABnzbd", "Alerts"):
+        for svc in ("Trakt", "TMDB", "Seerr", "Sonarr", "Radarr", "Jellyfin", "SABnzbd", "Alerts"):
             self.assertIn(f"✓ {svc}", out, f"{svc} missing/failed:\n{out}")
         self.assertNotIn("✗", out)
         self.assertIn("Validation OK", out)
@@ -206,6 +208,47 @@ class SonarrTests(_ProbeHarness):
         ok, out = _run_validate()
         self.assertFalse(ok)
         self.assertIn("✗ Sonarr", out)
+
+
+class RadarrTests(_ProbeHarness):
+    def test_radarr_ok_renders_check(self):
+        self._enter(*_all_good_env())
+        self._enter(*self._good_helpers())
+        ok, out = _run_validate()
+        self.assertTrue(ok)
+        self.assertIn("✓ Radarr", out)
+
+    def test_radarr_failure_is_not_required_fail(self):
+        self._enter(*_all_good_env())
+
+        # Radarr and Sonarr share the /api/v3/system/status path; distinguish by
+        # host so only Radarr fails here.
+        def fake(method, url, headers, **kw):
+            if "/api/v3/system/status" in url and "radarr" in url:
+                return None
+            return _ProbeHarness._fake_local_api(method, url, headers, **kw)
+
+        self._enter(
+            patch.object(trakt_discovery, "load_tokens", return_value=_future_tokens()),
+            patch.object(trakt_discovery, "trakt_get", return_value={}),
+            patch.object(trakt_discovery, "tmdb_get", return_value={}),
+            patch.object(trakt_discovery, "seerr_get", return_value={"version": "x"}),
+            patch.object(trakt_discovery, "_api_request_with_retry", side_effect=fake),
+        )
+        ok, out = _run_validate()
+        self.assertTrue(ok)  # Radarr is optional
+        self.assertIn("✗ Radarr", out)
+        self.assertIn("✓ Sonarr", out)
+
+    def test_radarr_unset_is_skipped_not_required_fail(self):
+        self._enter(*_all_good_env(RADARR_URL="", RADARR_API_KEY=""))
+        self._enter(*self._good_helpers())
+        ok, out = _run_validate()
+        self.assertTrue(ok)
+        self.assertNotIn("✓ Radarr", out)
+        self.assertNotIn("✗ Radarr", out)
+        self.assertIn("optional integrations not configured", out)
+        self.assertIn("Radarr", out)
 
 
 class JellyfinTests(_ProbeHarness):

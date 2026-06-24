@@ -28,6 +28,14 @@ Every 45 seconds, the script checks Jellyfin's active sessions. If a user starts
 
 If someone requests every season of a show, the script treats it as: **Season 1 full + Episode 1 of the rest**. This prevents downloading 15 seasons of a show nobody has started watching yet.
 
+### In-progress weekly priority boost
+
+When a new episode arrives for a season someone has been actively watching, it jumps the queue. On each polling cycle the script checks recent Jellyfin play activity: if the most-recent play of a season falls within `INPROGRESS_BOOST_WINDOW_DAYS` (default `7`), any newly grabbed episode of that season is bumped to **High priority** in SABnzbd so the next episode of a show you're mid-watch on doesn't sit behind bulk back-catalog downloads. Set `INPROGRESS_BOOST_WINDOW_DAYS=0` to disable.
+
+### Matched-by-ID auto-import
+
+Sonarr and Radarr sometimes park a perfectly good download in the queue with **"matched by ID — Manual Import required"**, waiting for a human to click Import. When `AUTO_IMPORT_BLOCKED` is `true` (the default), the script detects these blocked items each cycle and triggers the import automatically — Sonarr out of the box, and Radarr when `RADARR_URL`/`RADARR_API_KEY` are configured. Each instance is handled independently so a failure on one never blocks the other.
+
 ## Trakt Content Discovery
 
 Automatically discovers trending, popular, and recommended content via the Trakt API and requests it through Seerr. TV shows request only Season 1 — the core automation's E01-preview logic handles progressive unlocking as people watch.
@@ -185,7 +193,31 @@ docker exec cascade-media python -u /app/trakt_discovery.py reset
 
 # Re-authenticate (clear tokens and start over)
 docker exec cascade-media python -u /app/trakt_discovery.py reauth
+
+# Validate every integration's connection/config (see below)
+docker exec cascade-media python -u /app/trakt_discovery.py validate
+
+# Send a real test alert and assert each channel delivered (see below)
+docker exec cascade-media python -u /app/trakt_discovery.py test-alert --verify
 ```
+
+### `validate` — check every integration
+
+`validate` probes each service the stack depends on and prints a `✓`/`✗` line per integration:
+
+```bash
+docker exec cascade-media python -u /app/trakt_discovery.py validate
+```
+
+It checks **Trakt** (token presence/validity + an authed ping), **TMDB**, **Seerr**, **Sonarr**, **Radarr**, **Jellyfin** (server reachability plus that each `JELLYFIN_USER_IDS` entry is a real UUID, not a display name), **SABnzbd**, and **alert channels**. Required services (Trakt, Sonarr, Jellyfin) failing makes the command exit non-zero; optional services that aren't configured (TMDB, Seerr, Radarr, SABnzbd, alerts) are reported as skipped and don't fail the run. Add `--send` to fire a real test alert as part of the run. Secrets in any echoed URL or error are redacted.
+
+### `test-alert --verify` — confirm alert delivery
+
+```bash
+docker exec cascade-media python -u /app/trakt_discovery.py test-alert --verify
+```
+
+Sends a test alert and prints a per-channel delivery status (`✓`/`✗` for webhook and email). It exits non-zero if any configured channel failed to deliver, so it's safe to use in a health script.
 
 ---
 
@@ -243,6 +275,9 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 |----------|---------|-------------|
 | `SONARR_URL` | Required | Sonarr server URL |
 | `SONARR_API_KEY` | | Sonarr API key |
+| `RADARR_URL` | | Radarr server URL (enables movie auto-import) |
+| `RADARR_API_KEY` | | Radarr API key (enables movie auto-import) |
+| `AUTO_IMPORT_BLOCKED` | `true` | Auto-resolve Sonarr/Radarr "matched by ID — Manual Import required" queue blocks (Radarr handling needs `RADARR_URL`/`RADARR_API_KEY`) — see [Matched-by-ID auto-import](#matched-by-id-auto-import) |
 | `JELLYFIN_URL` | Required | Jellyfin server URL |
 | `JELLYFIN_API_KEY` | | Jellyfin API key |
 | `SEERR_URL` | Required | Seerr server URL |
@@ -258,6 +293,7 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `WEBHOOK_PORT` | `9191` | Port for the webhook listener |
 | `SABNZBD_URL` | Required | SABnzbd server URL |
 | `SABNZBD_API_KEY` | | SABnzbd API key (required for download priority management) |
+| `INPROGRESS_BOOST_WINDOW_DAYS` | `7` | Weekly priority boost window. A new episode of a season you watched within this many days is bumped to High in SABnzbd. `0` = disabled. See [In-progress weekly priority boost](#in-progress-weekly-priority-boost) |
 | `PLAYBACK_CHECK_INTERVAL` | `45` | How often to check for active playback (in seconds) |
 | `TRAKT_CLIENT_ID` | | Trakt API client ID (from https://trakt.tv/oauth/applications) |
 | `TRAKT_CLIENT_SECRET` | | Trakt API client secret |
@@ -391,6 +427,26 @@ docker exec cascade-media python /app/media_automation.py help
 ```
 
 ## Update to Latest Version
+
+The easiest way to update is the bundled helper script, which pulls the latest code **and** image, recreates the container, and cleans up the old image:
+
+```bash
+./update.sh
+```
+
+**Why not just `docker compose pull`?** `docker compose pull` updates only the container *image*. It does **not** touch the on-disk files in your checkout — `.env.example`, this `README.md`, the `docker-compose.yml`, and `CHANGELOG.md` all live in git, not the image. To get new env-var defaults, docs, and compose changes you need a `git pull` as well. `update.sh` does both:
+
+```bash
+#!/bin/bash
+set -e
+cd /mnt/user/appdata/media-automation
+git pull
+docker compose pull
+docker compose up -d --force-recreate
+docker image prune -f
+```
+
+If you prefer to do it by hand (image only, no on-disk file updates):
 
 ```bash
 docker compose pull && docker compose up -d
