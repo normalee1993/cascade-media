@@ -166,6 +166,8 @@ SEERR_USER_ID = get_int_env("SEERR_USER_ID", 0)  # Seerr user ID to attribute re
 # mirror the definitions in media_automation.py (the authoritative consumers).
 SONARR_URL = os.getenv("SONARR_URL", "")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
+RADARR_URL = os.getenv("RADARR_URL", "")
+RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 JELLYFIN_USER_IDS = parse_env_list("JELLYFIN_USER_IDS")
@@ -2017,6 +2019,28 @@ def _probe_sonarr(results):
         results["required_fail"] = True
 
 
+def _probe_radarr(results):
+    """Optional. GET /system/status using a minimal local helper.
+
+    Radarr powers movie auto-import (added in v1.8.0) but isn't required for
+    TV discovery/cascade, so a blank URL/key is reported as skipped, not failed.
+    """
+    if not (RADARR_URL and RADARR_API_KEY):
+        results["optional_unset"].append("Radarr")
+        return
+    try:
+        headers = {"X-Api-Key": RADARR_API_KEY, "Content-Type": "application/json"}
+        data = _api_request_with_retry(
+            requests.get, f"{RADARR_URL}/api/v3/system/status", headers, max_retries=1
+        )
+        if data is None:
+            _validate_print_fail("Radarr", f"request failed at {RADARR_URL}")
+            return
+        _validate_print_ok("Radarr", f"reachable (version {data.get('version', '?')})")
+    except Exception as e:
+        _validate_print_fail("Radarr", f"{type(e).__name__}: {e}")
+
+
 def _probe_jellyfin(results):
     """Required. GET /System/Info, then validate each JELLYFIN_USER_IDS entry."""
     if not (JELLYFIN_URL and JELLYFIN_API_KEY):
@@ -2124,6 +2148,7 @@ def cmd_validate(conn, send=False):
     _probe_tmdb(results)
     _probe_seerr(results)
     _probe_sonarr(results)
+    _probe_radarr(results)
     _probe_jellyfin(results)
     _probe_sabnzbd(results)
     _probe_alerts(conn, results, send=send)
