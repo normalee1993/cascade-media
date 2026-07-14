@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.9.0] - 2026-07-14
+
+AI discovery efficiency: the model now knows what you actually own, and every prompt is auditable. Fixes the ~21% of AI suggestion slots that were being wasted re-suggesting owned/watched titles (measured over the source's first month live).
+
+### Added
+- **Authoritative AI exclusion list.** `collect_ai_exclusions()` merges three sources, deduped by normalized title + type: the full **Sonarr/Radarr catalogs** (ground truth for owned/monitored — new `fetch_library_titles()`), the full **Trakt watched history** (reusing the same per-cycle fetch as the taste-profile summary, cached in `_ai_cache`), and the legacy reactive list from `trakt_discovered` (the only source that remembers titles since deleted from the arrs). Previously the prompt's "DO NOT suggest" block came only from the reactive list — a title had to be surfaced and skipped once before the AI learned it was owned, and its `LIMIT 300` had begun truncating (426 eligible). Any source failing degrades the list with a warning instead of failing the AI cycle.
+- **AI prompt/response artifacts.** The exact prompt sent to Gemini and its verbatim reply are written to `ai_prompt_last.txt` / `ai_response_last.txt` next to the database, overwritten each cycle — so audits can read exactly what the model was given instead of reconstructing it from discovery records. Write failures are non-fatal.
+
+### Changed
+- `fetch_ai_exclusions()` is now a fallback input to the merged list; its cap raised 300 → 1000.
+- Exclusion entries include the year when known (`Title (2024, movie)`) to disambiguate remakes.
+- Sonarr/Radarr env vars (already present for `validate`) are now also used by discovery for the exclusion catalog.
+
+### Notes
+- SemVer: MINOR — backward-compatible; no new env vars required.
+- Verified via isolated DRY_RUN: exclusion list 975 titles ("library ok"), prompt contains known-owned spot-checks, all 4 suggestion slots filled with fresh titles, zero owned/watched re-suggestions.
+- 209 unit tests pass (11 new).
+
 ## [v1.8.1] - 2026-06-18
 
 Cascade unlock correctness fixes (caught in production logs) plus validator/docs/deploy finishing touches.
