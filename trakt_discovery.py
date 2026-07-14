@@ -17,6 +17,8 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import taste_profile
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -153,6 +155,15 @@ AI_SUGGESTIONS_MULTIPLIER = get_int_env("AI_SUGGESTIONS_MULTIPLIER", 3)
 # for the "ai" source only, without loosening trending/popular/etc.
 AI_MIN_RATING = get_float_env("AI_MIN_RATING", TRAKT_MIN_RATING)
 AI_MIN_VOTES = get_int_env("AI_MIN_VOTES", TRAKT_MIN_VOTES)
+# Statistical taste profile (v1.10.0) — distilled genre/theme/people/pace
+# stats computed locally (see taste_profile.py) and added to the prompt
+# alongside a trimmed raw history. Off by default; flip after validating
+# the rendered block in ai_taste_profile.txt via a DRY_RUN.
+AI_PROFILE = os.getenv("AI_PROFILE", "false").lower() == "true"
+AI_PROFILE_HALF_LIFE_DAYS = get_int_env("AI_PROFILE_HALF_LIFE_DAYS", 90)
+# Jellyfin display name (or GUID) whose play state feeds the per-person
+# signals (binged/abandoned/favorites). Unset = skip Jellyfin signals.
+AI_PROFILE_JELLYFIN_USER = os.getenv("AI_PROFILE_JELLYFIN_USER", "").strip()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Seerr
@@ -1012,10 +1023,12 @@ def collect_ai_exclusions(conn):
 
 
 def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows, n_movies,
-                    blocked_platforms=None):
+                    blocked_platforms=None, profile_block=None):
     """Assemble the recommendation prompt. Pure function — unit-testable.
     blocked_platforms: networks/providers the user filters out downstream — the
-    model is told to avoid titles exclusive to them so it doesn't waste slots."""
+    model is told to avoid titles exclusive to them so it doesn't waste slots.
+    profile_block: pre-rendered taste-profile text (taste_profile.py) placed
+    ahead of the raw history — profile + history together beat either alone."""
     lines = []
     asks = []
     if n_shows:
@@ -1046,8 +1059,13 @@ def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows,
             "this week before deciding."
         )
 
+    if profile_block:
+        lines.append("\n" + profile_block)
+
     if history:
-        lines.append("\nRECENT WATCH HISTORY (taste profile, most recent first):")
+        header = ("\nRECENT WATCH HISTORY (most recent first):" if profile_block
+                  else "\nRECENT WATCH HISTORY (taste profile, most recent first):")
+        lines.append(header)
         for h in history:
             genres = ",".join(h["genres"])
             lines.append(f"- {h['title']} ({h['year']}) [{genres}] plays={h['plays']} last={h['last_watched']}")
@@ -1267,10 +1285,27 @@ def fetch_ai_list(conn, media_type):
             n_shows = AI_SUGGESTIONS_MULTIPLIER * limits["show"]
             n_movies = AI_SUGGESTIONS_MULTIPLIER * limits["movie"]
 
+            profile_block = None
+            if AI_PROFILE:
+                # Distilled stats supplement raw history, so the raw section
+                # can shrink — the profile carries the long-tail signal.
+                profile_block = taste_profile.build_and_render(
+                    conn=conn,
+                    watched={mt: _fetch_watched_items(conn, mt) or []
+                             for mt in enabled_types},
+                    tmdb_get=tmdb_get, trakt_get=trakt_get,
+                    jellyfin_url=JELLYFIN_URL, jellyfin_api_key=JELLYFIN_API_KEY,
+                    jellyfin_user=AI_PROFILE_JELLYFIN_USER,
+                    half_life_days=AI_PROFILE_HALF_LIFE_DAYS,
+                )
+                if profile_block:
+                    _write_ai_artifact("ai_taste_profile.txt", profile_block)
+
+            history_limit = min(AI_HISTORY_ITEMS, 25) if profile_block else AI_HISTORY_ITEMS
             history = []
             trakt_trending = []
             for mt in enabled_types:
-                history.extend(fetch_watch_history_summary(conn, mt, AI_HISTORY_ITEMS))
+                history.extend(fetch_watch_history_summary(conn, mt, history_limit))
                 trakt_trending.extend(_trending_titles_for_prompt(conn, mt))
 
             # Tell the model which platforms the user filters out so it doesn't
@@ -1280,7 +1315,7 @@ def fetch_ai_list(conn, media_type):
             prompt = build_ai_prompt(
                 history, trakt_trending, _tmdb_trending_titles(),
                 collect_ai_exclusions(conn), n_shows, n_movies,
-                blocked_platforms=blocked_platforms,
+                blocked_platforms=blocked_platforms, profile_block=profile_block,
             )
             log.debug(f"AI prompt:\n{prompt}")
             _write_ai_artifact("ai_prompt_last.txt", prompt)

@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir requests==2.34.0 tzdata==2026.2
 COPY media_automation.py /app/
 COPY scheduler.py /app/
 COPY trakt_discovery.py /app/
+COPY taste_profile.py /app/
 
 # /data is the bind-mount target; chown so non-root user can write SQLite + tokens
 RUN mkdir -p /data && chown -R 99:100 /data /app

@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.10.0] - 2026-07-14
+
+Statistical taste profile for AI discovery: a locally computed, recency-weighted distillation of watch behavior added to the Gemini prompt alongside (not replacing) the raw history — the combination outperforms either alone per LLM-recommender research. Off by default (`AI_PROFILE=true` to enable).
+
+### Added
+- **`taste_profile.py`** (new module) — pure-stdlib statistics over three local sources:
+  - **Trakt watched history**: recency-decayed genre shares (`w = 0.5^(days/half_life)`, default 90-day half-life), release-era preference, movie rewatches.
+  - **TMDB keywords + credits**, cached incrementally in a new `ai_title_metadata` table (≤40 lookups/cycle; profile matures over ~1 week, steady state ~0 calls): recurring themes, repeatedly watched actors/creators, weighted-median runtimes.
+  - **Jellyfin play state for ONE selected user** (`AI_PROFILE_JELLYFIN_USER`, display name or GUID): binged series (≥90% watched within 7 days — strong likes), abandoned series (≤40% watched, idle 60+ days — explicit "avoid similar"), favorites, rewatch counts. Per-person by design: blending five household accounts would smear the pace signals into noise.
+  - **Trakt personal ratings** (only if ≥10 exist): 9-10 titles as loves, ≤5 as explicit dislikes.
+- The rendered block is persisted to `ai_taste_profile.txt` next to the database — read it to see exactly what is sent to Gemini. All raw play data stays local; only the distilled text leaves the box.
+- With a profile present, the raw history section trims to ≤25 rows per type (the profile carries the long-tail signal).
+- New env: `AI_PROFILE` (default false), `AI_PROFILE_JELLYFIN_USER`, `AI_PROFILE_HALF_LIFE_DAYS` (90). Documented in `.env.example`.
+
+### Fixed (during verification dry-runs)
+- Rewatch ranking crashed on titles without a year (`int < None` tuple comparison).
+- Trakt's hyphenated genre slugs (`science-fiction`) never matched the majors list, wrongly declaring sci-fi "never watched" for a household that binged *Dark Matter*.
+
+### Notes
+- SemVer: MINOR — inert unless `AI_PROFILE=true`; profile failure of any kind degrades to the profile-less prompt with a warning.
+- Verified via isolated DRY_RUN: profile computed from 200 titles + 120 cached TMDB entries + AzureAperture's Jellyfin state; all 4 suggestion slots filled; suggestions visibly shifted toward profile themes (Longlegs, Strange Darling vs. the profile-less run's picks).
+- 236 unit tests pass (27 new).
+
 ## [v1.9.0] - 2026-07-14
 
 AI discovery efficiency: the model now knows what you actually own, and every prompt is auditable. Fixes the ~21% of AI suggestion slots that were being wasted re-suggesting owned/watched titles (measured over the source's first month live).

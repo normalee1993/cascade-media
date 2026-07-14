@@ -326,6 +326,48 @@ class GeminiRequestShapeTests(unittest.TestCase):
                 trakt_discovery.gemini_generate("prompt")
 
 
+class ProfileBlockPromptTests(unittest.TestCase):
+    """build_ai_prompt + fetch_ai_list wiring for the taste profile (v1.10.0)."""
+
+    def test_profile_block_precedes_history(self):
+        prompt = trakt_discovery.build_ai_prompt(
+            history=[{"title": "T", "year": 2024, "genres": ["drama"],
+                      "plays": 1, "last_watched": "2026-07-01"}],
+            trakt_trending=[], tmdb_trending=[], exclusions=[],
+            n_shows=2, n_movies=2,
+            profile_block="TASTE PROFILE (computed locally from 5 watched titles)")
+        self.assertIn("TASTE PROFILE", prompt)
+        self.assertLess(prompt.index("TASTE PROFILE"),
+                        prompt.index("RECENT WATCH HISTORY"))
+
+    def test_no_profile_keeps_legacy_history_header(self):
+        prompt = trakt_discovery.build_ai_prompt(
+            history=[{"title": "T", "year": 2024, "genres": ["drama"],
+                      "plays": 1, "last_watched": "2026-07-01"}],
+            trakt_trending=[], tmdb_trending=[], exclusions=[],
+            n_shows=2, n_movies=2)
+        self.assertIn("RECENT WATCH HISTORY (taste profile", prompt)
+        self.assertNotIn("TASTE PROFILE (computed", prompt)
+
+    def test_fetch_ai_list_skips_profile_when_flag_off(self):
+        trakt_discovery._ai_cache.clear()
+        with patch.object(trakt_discovery, "GEMINI_API_KEY", "test-key"), \
+             patch.object(trakt_discovery, "AI_PROFILE", False), \
+             patch.object(trakt_discovery, "TRAKT_DISCOVER_SHOWS", True), \
+             patch.object(trakt_discovery, "TRAKT_DISCOVER_MOVIES", False), \
+             patch.object(trakt_discovery, "TRAKT_MAX_SHOW_REQUESTS", 2), \
+             patch.object(trakt_discovery, "fetch_watch_history_summary", return_value=[]), \
+             patch.object(trakt_discovery, "_trending_titles_for_prompt", return_value=[]), \
+             patch.object(trakt_discovery, "_tmdb_trending_titles", return_value=[]), \
+             patch.object(trakt_discovery, "collect_ai_exclusions", return_value=[]), \
+             patch.object(trakt_discovery.taste_profile, "build_and_render") as profile, \
+             patch.object(trakt_discovery.requests, "post",
+                          return_value=_gemini_response("[]")):
+            trakt_discovery.fetch_ai_list(None, "show")
+        profile.assert_not_called()
+        trakt_discovery._ai_cache.clear()
+
+
 def _watched_item(media_type, title, year):
     """A Trakt /users/me/watched entry in the real API shape (trimmed)."""
     return {
