@@ -14,7 +14,7 @@ AI discovery efficiency: the model now knows what you actually own, and every pr
 
 ### Changed
 - `fetch_ai_exclusions()` is now a fallback input to the merged list; its cap raised 300 → 1000.
-- Exclusion entries include the year when known (`Title (2024, movie)`) to disambiguate remakes.
+- Exclusion entries include the year when known (`Title (2024, movie)`) to disambiguate remakes — unless the title already embeds a year (Sonarr disambiguation like `Foundation (2021)`), which is no longer double-printed.
 - Sonarr/Radarr env vars (already present for `validate`) are now also used by discovery for the exclusion catalog.
 
 ### Notes
