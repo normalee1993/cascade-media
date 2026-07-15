@@ -213,7 +213,7 @@ class FetchAiListTests(unittest.TestCase):
             patch.object(trakt_discovery, "fetch_watch_history_summary", return_value=[]),
             patch.object(trakt_discovery, "_trending_titles_for_prompt", return_value=[]),
             patch.object(trakt_discovery, "_tmdb_trending_titles", return_value=[]),
-            patch.object(trakt_discovery, "fetch_ai_exclusions", return_value=[]),
+            patch.object(trakt_discovery, "collect_ai_exclusions", return_value=[]),
         ]
         for p in self._patches:
             p.start()
@@ -324,6 +324,165 @@ class GeminiRequestShapeTests(unittest.TestCase):
              patch.object(trakt_discovery.requests, "post", return_value=resp):
             with self.assertRaises(ValueError):
                 trakt_discovery.gemini_generate("prompt")
+
+
+def _watched_item(media_type, title, year):
+    """A Trakt /users/me/watched entry in the real API shape (trimmed)."""
+    return {
+        "plays": 1,
+        "last_watched_at": "2026-07-01T00:00:00.000Z",
+        media_type: {"title": title, "year": year, "genres": ["drama"],
+                     "ids": {"trakt": 1, "tmdb": 100}},
+    }
+
+
+class CollectAiExclusionsTests(unittest.TestCase):
+    """collect_ai_exclusions — authoritative merge of arr catalog + Trakt
+    watched + legacy DB rows, with per-source degradation (v1.9.0)."""
+
+    def setUp(self):
+        trakt_discovery._ai_cache.clear()
+
+    def tearDown(self):
+        trakt_discovery._ai_cache.clear()
+
+    def test_merges_and_dedups_across_sources(self):
+        """Same title from arr, watched, and legacy DB appears exactly once;
+        the richer arr entry (with year) wins by arriving first."""
+        watched = {
+            "show": [_watched_item("show", "Severance", 2022)],
+            "movie": [_watched_item("movie", "Dune", 2021)],
+        }
+        with patch.object(trakt_discovery, "fetch_library_titles",
+                          return_value=[("Severance", 2022, "show"),
+                                        ("Heat", 1995, "movie")]), \
+             patch.object(trakt_discovery, "_fetch_watched_items",
+                          side_effect=lambda conn, mt: watched[mt]), \
+             patch.object(trakt_discovery, "fetch_ai_exclusions",
+                          return_value=["Severance (show)", "Old Movie (movie)"]):
+            lines = trakt_discovery.collect_ai_exclusions(None)
+        self.assertEqual(sorted(lines), sorted([
+            "Severance (2022, show)", "Heat (1995, movie)",
+            "Dune (2021, movie)", "Old Movie (movie)",
+        ]))
+
+    def test_title_with_embedded_year_not_double_printed(self):
+        """Sonarr bakes a disambiguating year into same-named titles; the
+        exclusion line must not read 'Foundation (2021) (2021, show)'."""
+        with patch.object(trakt_discovery, "fetch_library_titles",
+                          return_value=[("Foundation (2021)", 2021, "show")]), \
+             patch.object(trakt_discovery, "_fetch_watched_items", return_value=None), \
+             patch.object(trakt_discovery, "fetch_ai_exclusions", return_value=[]):
+            lines = trakt_discovery.collect_ai_exclusions(None)
+        self.assertEqual(lines, ["Foundation (2021) (show)"])
+
+    def test_arr_failure_degrades_to_other_sources(self):
+        """Library fetch failing (None) must not raise — watched + legacy
+        still populate the list, matching pre-v1.9.0 behavior or better."""
+        with patch.object(trakt_discovery, "fetch_library_titles", return_value=None), \
+             patch.object(trakt_discovery, "_fetch_watched_items", return_value=None), \
+             patch.object(trakt_discovery, "fetch_ai_exclusions",
+                          return_value=["Fallback Title (show)"]):
+            lines = trakt_discovery.collect_ai_exclusions(None)
+        self.assertEqual(lines, ["Fallback Title (show)"])
+
+    def test_legacy_db_error_is_non_fatal(self):
+        with patch.object(trakt_discovery, "fetch_library_titles",
+                          return_value=[("Heat", 1995, "movie")]), \
+             patch.object(trakt_discovery, "_fetch_watched_items", return_value=None), \
+             patch.object(trakt_discovery, "fetch_ai_exclusions",
+                          side_effect=Exception("db locked")):
+            lines = trakt_discovery.collect_ai_exclusions(None)
+        self.assertEqual(lines, ["Heat (1995, movie)"])
+
+
+class FetchLibraryTitlesTests(unittest.TestCase):
+    """fetch_library_titles — arr catalogs as exclusion ground truth."""
+
+    def test_collects_both_arrs(self):
+        payloads = {
+            "series": [{"title": "Severance", "year": 2022}],
+            "movie": [{"title": "Heat", "year": 1995}, {"title": ""}],
+        }
+        def fake_get(method, url, headers, **kw):
+            return payloads["series"] if "/series" in url else payloads["movie"]
+        with patch.object(trakt_discovery, "SONARR_URL", "http://s"), \
+             patch.object(trakt_discovery, "SONARR_API_KEY", "k"), \
+             patch.object(trakt_discovery, "RADARR_URL", "http://r"), \
+             patch.object(trakt_discovery, "RADARR_API_KEY", "k"), \
+             patch.object(trakt_discovery, "_api_request_with_retry", side_effect=fake_get):
+            titles = trakt_discovery.fetch_library_titles()
+        # Blank-titled entries are dropped; (title, year, type) tuples returned
+        self.assertEqual(titles, [("Severance", 2022, "show"), ("Heat", 1995, "movie")])
+
+    def test_unconfigured_arr_is_skipped_not_failed(self):
+        with patch.object(trakt_discovery, "SONARR_URL", "http://s"), \
+             patch.object(trakt_discovery, "SONARR_API_KEY", "k"), \
+             patch.object(trakt_discovery, "RADARR_URL", ""), \
+             patch.object(trakt_discovery, "RADARR_API_KEY", ""), \
+             patch.object(trakt_discovery, "_api_request_with_retry",
+                          return_value=[{"title": "Severance", "year": 2022}]):
+            titles = trakt_discovery.fetch_library_titles()
+        self.assertEqual(titles, [("Severance", 2022, "show")])
+
+    def test_configured_arr_failure_returns_none(self):
+        """A reachable-but-failing configured arr must signal failure (None),
+        so the caller logs the degradation instead of silently thinning."""
+        with patch.object(trakt_discovery, "SONARR_URL", "http://s"), \
+             patch.object(trakt_discovery, "SONARR_API_KEY", "k"), \
+             patch.object(trakt_discovery, "_api_request_with_retry", return_value=None):
+            self.assertIsNone(trakt_discovery.fetch_library_titles())
+
+
+class AiArtifactTests(unittest.TestCase):
+    """_write_ai_artifact — verbatim prompt/response persistence for audits."""
+
+    def test_writes_next_to_db(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(trakt_discovery, "DB_PATH", os.path.join(tmp, "x.db")):
+                trakt_discovery._write_ai_artifact("ai_prompt_last.txt", "the prompt")
+            with open(os.path.join(tmp, "ai_prompt_last.txt")) as f:
+                self.assertEqual(f.read(), "the prompt")
+
+    def test_write_failure_is_non_fatal(self):
+        with patch.object(trakt_discovery, "DB_PATH", "/nonexistent-dir/x.db"):
+            trakt_discovery._write_ai_artifact("ai_prompt_last.txt", "p")  # must not raise
+
+
+class WatchedItemsCacheTests(unittest.TestCase):
+    """_fetch_watched_items — one Trakt fetch serves summary + exclusions."""
+
+    def setUp(self):
+        trakt_discovery._ai_cache.clear()
+
+    def tearDown(self):
+        trakt_discovery._ai_cache.clear()
+
+    def test_second_call_uses_cache(self):
+        items = [_watched_item("show", "Severance", 2022)]
+        with patch.object(trakt_discovery, "trakt_get", return_value=items) as m:
+            first = trakt_discovery._fetch_watched_items(None, "show")
+            second = trakt_discovery._fetch_watched_items(None, "show")
+        m.assert_called_once()
+        self.assertEqual(first, second)
+
+    def test_failure_cached_as_none(self):
+        with patch.object(trakt_discovery, "trakt_get", return_value=None) as m:
+            self.assertIsNone(trakt_discovery._fetch_watched_items(None, "show"))
+            self.assertIsNone(trakt_discovery._fetch_watched_items(None, "show"))
+        m.assert_called_once()
+
+    def test_summary_does_not_mutate_cache(self):
+        """fetch_watch_history_summary sorts its copy — the cached list must
+        keep the API's original order for other consumers."""
+        items = [_watched_item("show", "Old", 2000),
+                 _watched_item("show", "New", 2024)]
+        items[1]["last_watched_at"] = "2026-07-10T00:00:00.000Z"
+        with patch.object(trakt_discovery, "trakt_get", return_value=items):
+            trakt_discovery.fetch_watch_history_summary(None, "show", 10)
+            cached = trakt_discovery._fetch_watched_items(None, "show")
+        self.assertEqual(cached[0]["show"]["title"], "Old")
 
 
 if __name__ == "__main__":

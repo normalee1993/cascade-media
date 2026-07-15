@@ -161,9 +161,10 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 SEERR_HEADERS = {"X-Api-Key": SEERR_API_KEY, "Content-Type": "application/json"}
 SEERR_USER_ID = get_int_env("SEERR_USER_ID", 0)  # Seerr user ID to attribute requests to
 
-# Sonarr / Jellyfin / SABnzbd — not used by discovery itself; read here only so the
-# `validate` command can probe every integration the wider stack depends on. These
-# mirror the definitions in media_automation.py (the authoritative consumers).
+# Sonarr / Jellyfin / SABnzbd — mirror the definitions in media_automation.py (the
+# authoritative consumers). Discovery uses Sonarr/Radarr for the AI exclusion
+# catalog (fetch_library_titles); the rest are read so the `validate` command can
+# probe every integration the wider stack depends on.
 SONARR_URL = os.getenv("SONARR_URL", "")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 RADARR_URL = os.getenv("RADARR_URL", "")
@@ -887,15 +888,27 @@ def poll_device_token(conn, device_code, interval, expires_in):
 # ============================================================
 # AI DISCOVERY (Gemini)
 # ============================================================
+def _fetch_watched_items(conn, media_type):
+    """Full Trakt watched list, cached in _ai_cache for the cycle. One fetch
+    serves both the history summary and the exclusion list. Returns None on
+    failure so callers can tell 'nothing watched' from 'fetch failed'."""
+    key = ("watched_raw", media_type)
+    if key not in _ai_cache:
+        items = trakt_get(f"/users/me/watched/{media_type}s", params={"extended": "full"},
+                          auth_required=True, conn=conn)
+        _ai_cache[key] = items if isinstance(items, list) else None
+    return _ai_cache[key]
+
+
 def fetch_watch_history_summary(conn, media_type, limit):
     """Compact taste profile from Trakt watch history for the AI prompt.
     Returns [] on failure — degraded context is acceptable; total AI failure
     is handled at the fetch_ai_list level."""
-    items = trakt_get(f"/users/me/watched/{media_type}s", params={"extended": "full"},
-                      auth_required=True, conn=conn)
-    if not isinstance(items, list):
+    items = _fetch_watched_items(conn, media_type)
+    if items is None:
         log.warning(f"Could not fetch watch history for AI taste profile ({media_type}s)")
         return []
+    items = list(items)
 
     items.sort(key=lambda i: i.get("last_watched_at") or "", reverse=True)
     summary = []
@@ -914,10 +927,12 @@ def fetch_watch_history_summary(conn, media_type, limit):
     return summary
 
 
-def fetch_ai_exclusions(conn, limit=300):
-    """Titles the AI must not re-suggest: already requested, in the library, or
-    watched. Filter-based skips are absent on purpose — they get re-filtered
-    anyway, and config changes may un-skip them."""
+def fetch_ai_exclusions(conn, limit=1000):
+    """Legacy reactive exclusion source: titles discovery itself has seen land
+    as requested/owned/watched. Kept as one input to collect_ai_exclusions —
+    it is the only source that remembers titles since deleted from the arrs.
+    Filter-based skips are absent on purpose — they get re-filtered anyway,
+    and config changes may un-skip them."""
     rows = conn.execute(
         "SELECT title, media_type FROM trakt_discovered "
         "WHERE action IN ('requested', 'skipped_exists', 'skipped_watched') "
@@ -925,6 +940,77 @@ def fetch_ai_exclusions(conn, limit=300):
         (limit,)
     ).fetchall()
     return [f"{title} ({media_type})" for title, media_type in rows]
+
+
+def fetch_library_titles():
+    """Full owned/monitored catalog straight from Sonarr + Radarr — the ground
+    truth for 'don't suggest this, we have it'. Returns a list of
+    (title, year, media_type) tuples, or None if a *configured* arr could not
+    be reached (unconfigured arrs are skipped silently — Radarr is optional)."""
+    catalogs = (
+        ("show", SONARR_URL, SONARR_API_KEY, "/api/v3/series"),
+        ("movie", RADARR_URL, RADARR_API_KEY, "/api/v3/movie"),
+    )
+    titles = []
+    for media_type, url, key, endpoint in catalogs:
+        if not (url and key):
+            continue
+        headers = {"X-Api-Key": key, "Content-Type": "application/json"}
+        data = _api_request_with_retry(requests.get, f"{url}{endpoint}", headers, max_retries=1)
+        if not isinstance(data, list):
+            log.warning(f"Could not fetch {media_type} catalog from {url} for AI exclusions")
+            return None
+        for entry in data:
+            if entry.get("title"):
+                titles.append((entry["title"], entry.get("year"), media_type))
+    return titles
+
+
+def collect_ai_exclusions(conn):
+    """Authoritative 'DO NOT suggest' list for the AI prompt. Merges, deduped
+    by (normalized title, type):
+    - Sonarr/Radarr catalogs — everything on disk or monitored
+    - the full Trakt watched history (reuses the per-cycle cached fetch)
+    - the legacy reactive list from trakt_discovered (covers titles deleted
+      from the arrs, and everything else if the arr catalogs are down)
+    Any source failing degrades the list instead of failing the AI cycle."""
+    seen = set()
+    lines = []
+
+    def add(title, year, media_type):
+        dedup_key = (_normalize_title(title), media_type)
+        if dedup_key in seen:
+            return
+        seen.add(dedup_key)
+        # Sonarr/Radarr disambiguate same-named titles by baking the year into
+        # the title itself ("Foundation (2021)"); don't print the year twice.
+        if year and not re.search(r"\(\d{4}\)\s*$", title):
+            lines.append(f"{title} ({year}, {media_type})")
+        else:
+            lines.append(f"{title} ({media_type})")
+
+    library = fetch_library_titles()
+    for title, year, media_type in (library or []):
+        add(title, year, media_type)
+
+    for media_type in ("show", "movie"):
+        for item in (_fetch_watched_items(conn, media_type) or []):
+            media = item.get(media_type, {})
+            if media.get("title"):
+                add(media["title"], media.get("year"), media_type)
+
+    try:
+        for line in fetch_ai_exclusions(conn):
+            # Legacy lines are pre-formatted "Title (type)"; re-parse the title
+            # for dedup against the richer sources above.
+            title, _, media_type = line.rpartition(" (")
+            add(title, None, media_type.rstrip(")"))
+    except Exception as e:
+        log.warning(f"Could not read legacy AI exclusions from DB: {e}")
+
+    log.info(f"AI exclusion list: {len(lines)} titles "
+             f"(library {'ok' if library is not None else 'UNAVAILABLE — degraded'})")
+    return lines
 
 
 def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows, n_movies,
@@ -977,7 +1063,7 @@ def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows,
         lines.extend(f"- {t}" for t in tmdb_trending)
 
     if exclusions:
-        lines.append("\nDO NOT suggest any of these (already watched, requested, or in the library):")
+        lines.append("\nDO NOT suggest any of these (already in the user's library, watched, or requested):")
         lines.extend(f"- {e}" for e in exclusions)
     lines.append("Also never suggest anything already in the watch history above.")
 
@@ -995,6 +1081,18 @@ def build_ai_prompt(history, trakt_trending, tmdb_trending, exclusions, n_shows,
         "\"reason\": str (one short sentence)}."
     )
     return "\n".join(lines)
+
+
+def _write_ai_artifact(filename, text):
+    """Persist the exact AI prompt/response next to the DB, overwritten each
+    cycle, so audits can see verbatim what Gemini was given and returned
+    instead of reconstructing it from trakt_discovered. Never fatal."""
+    try:
+        path = os.path.join(os.path.dirname(DB_PATH) or ".", filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        log.warning(f"Could not write AI artifact {filename}: {e}")
 
 
 def gemini_generate(prompt):
@@ -1183,12 +1281,16 @@ def fetch_ai_list(conn, media_type):
                 TMDB_DISALLOWED_NETWORKS + TMDB_DISALLOWED_PROVIDERS))
             prompt = build_ai_prompt(
                 history, trakt_trending, _tmdb_trending_titles(),
-                fetch_ai_exclusions(conn), n_shows, n_movies,
+                collect_ai_exclusions(conn), n_shows, n_movies,
                 blocked_platforms=blocked_platforms,
             )
+            log.debug(f"AI prompt:\n{prompt}")
+            _write_ai_artifact("ai_prompt_last.txt", prompt)
             log.info(f"Querying {AI_MODEL} for AI recommendations "
                      f"(web search: {AI_WEB_SEARCH}, asking for {n_shows} shows / {n_movies} movies)")
-            suggestions = parse_ai_suggestions(gemini_generate(prompt))
+            raw_response = gemini_generate(prompt)
+            _write_ai_artifact("ai_response_last.txt", raw_response)
+            suggestions = parse_ai_suggestions(raw_response)
             split = {"show": [], "movie": []}
             for s in suggestions:
                 split[s["media_type"]].append(s)
