@@ -993,7 +993,9 @@ def collect_ai_exclusions(conn):
         if dedup_key in seen:
             return
         seen.add(dedup_key)
-        if year:
+        # Sonarr/Radarr disambiguate same-named titles by baking the year into
+        # the title itself ("Foundation (2021)"); don't print the year twice.
+        if year and not re.search(r"\(\d{4}\)\s*$", title):
             lines.append(f"{title} ({year}, {media_type})")
         else:
             lines.append(f"{title} ({media_type})")

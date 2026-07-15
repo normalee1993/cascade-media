@@ -408,6 +408,16 @@ class CollectAiExclusionsTests(unittest.TestCase):
             "Dune (2021, movie)", "Old Movie (movie)",
         ]))
 
+    def test_title_with_embedded_year_not_double_printed(self):
+        """Sonarr bakes a disambiguating year into same-named titles; the
+        exclusion line must not read 'Foundation (2021) (2021, show)'."""
+        with patch.object(trakt_discovery, "fetch_library_titles",
+                          return_value=[("Foundation (2021)", 2021, "show")]), \
+             patch.object(trakt_discovery, "_fetch_watched_items", return_value=None), \
+             patch.object(trakt_discovery, "fetch_ai_exclusions", return_value=[]):
+            lines = trakt_discovery.collect_ai_exclusions(None)
+        self.assertEqual(lines, ["Foundation (2021) (show)"])
+
     def test_arr_failure_degrades_to_other_sources(self):
         """Library fetch failing (None) must not raise — watched + legacy
         still populate the list, matching pre-v1.9.0 behavior or better."""
