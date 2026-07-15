@@ -17,8 +17,8 @@ Sources:
   table (max AI_PROFILE_TMDB_FETCHES_PER_CYCLE new lookups per cycle, so
   the profile matures over the first week without a call burst).
 - Jellyfin play state for ONE selected user (AI_PROFILE_JELLYFIN_USER):
-  completion/binge/abandonment are per-person signals — blending five
-  household accounts would smear them into noise.
+  binge/favorite/rewatch are per-person signals — blending five household
+  accounts would smear them into noise.
 - Trakt personal ratings, used only if the account actually rates
   (>= MIN_RATINGS_TO_USE entries).
 
@@ -42,14 +42,16 @@ log = logging.getLogger("taste_profile")
 MIN_RATINGS_TO_USE = 10
 
 # Series shorter than this many downloaded episodes can't meaningfully be
-# "binged" or "abandoned" — a 3-episode miniseries watched in one sitting
-# says nothing that plain watch history doesn't.
+# "binged" — a 3-episode miniseries watched in one sitting says nothing that
+# plain watch history doesn't.
 MIN_EPISODES_FOR_PACE = 4
 
 BINGE_COMPLETION = 0.9     # >=90% watched...
 BINGE_WINDOW_DAYS = 7      # ...within a week of first play = strong like
-ABANDON_COMPLETION = 0.4   # <=40% watched...
-ABANDON_IDLE_DAYS = 60     # ...and untouched for 2 months = strong dislike
+# NB: we deliberately do NOT infer dislike from low completion + long idle.
+# This household starts many shows and circles back later, so a half-watched
+# idle series is backlog, not a thumbs-down. Genuine dislikes come only from
+# explicit Trakt ratings (<=5).
 
 
 # ============================================================
@@ -185,14 +187,23 @@ def fetch_jellyfin_signals(url, api_key, user_id):
             "IncludeItemTypes": "Episode", "Recursive": "true",
             "Fields": "UserData,SeriesName",
         }).get("Items", [])
+        # Show-level IsFavorite lives on the Series item — users favorite the
+        # show, not individual episodes, so the episode list never sees it.
+        show_items = _jellyfin_get(url, api_key, f"/Users/{user_id}/Items", {
+            "IncludeItemTypes": "Series", "Recursive": "true",
+            "Fields": "UserData",
+        }).get("Items", [])
     except Exception as e:
         log.warning(f"Taste profile: Jellyfin signals unavailable: {e}")
         return None
 
     movie_stats = {}
     for m in movies:
+        name = m.get("Name")
+        if not name:  # a nameless item would poison the title lists downstream
+            continue
         ud = m.get("UserData") or {}
-        movie_stats[m.get("Name")] = {
+        movie_stats[name] = {
             "plays": ud.get("PlayCount", 0),
             "favorite": bool(ud.get("IsFavorite")),
         }
@@ -214,6 +225,12 @@ def fetch_jellyfin_signals(url, api_key, user_id):
                 s["last"] = max(s["last"] or when, when)
         if ud.get("IsFavorite"):
             s["favorite"] = True
+    # Seed show-level favorites (the reliable signal; episode favorites above
+    # are a weak bonus).
+    for item in show_items:
+        name = item.get("Name")
+        if name and (item.get("UserData") or {}).get("IsFavorite"):
+            series[name]["favorite"] = True
     return {"movies": movie_stats, "series": dict(series)}
 
 
@@ -242,9 +259,12 @@ def _parse_jf_date(value):
 
 
 def compute_profile(watched, metadata, jf_signals, ratings=None, now=None,
-                    half_life_days=90):
+                    half_life_days=90, baseline_genres=None):
     """All profile statistics from pre-fetched inputs. Pure — unit-testable
-    with fixtures, no I/O. Returns a dict of ranked signal lists."""
+    with fixtures, no I/O. Returns a dict of ranked signal lists.
+    baseline_genres: {genre: population_share} (e.g. from trending) used to
+    compute lift — how much the user over-indexes on a genre vs. that
+    baseline — so the profile can say what's DISTINCTIVE, not just frequent."""
     now = now or datetime.now(timezone.utc)
 
     genre_w = defaultdict(float)
@@ -286,8 +306,21 @@ def compute_profile(watched, metadata, jf_signals, ratings=None, now=None,
                 if meta["runtime"]:
                     runtime_pairs[media_type].append((meta["runtime"], w))
 
+    # Lift = user's share of a genre vs. the baseline population's share.
+    # Laplace-smoothed so a genre absent from the (small) baseline sample
+    # doesn't explode to a huge multiplier. None when no baseline supplied.
+    user_genre_total = sum(genre_w.values()) or 1.0
+
+    def _lift(g):
+        if not baseline_genres:
+            return None
+        eps = 0.02
+        u = genre_w[g] / user_genre_total
+        return (u + eps) / (baseline_genres.get(g, 0.0) + eps)
+
     top_genres = sorted(genre_w.items(), key=lambda kv: -kv[1])[:6]
-    genre_shares = [(g, w / total_w) for g, w in top_genres] if total_w else []
+    genre_shares = ([(g, w / total_w, _lift(g)) for g, w in top_genres]
+                    if total_w else [])
     # "Avoided" = major genres conspicuous by absence. Only genres common
     # enough that a zero share is a choice, not a coincidence.
     majors = {"drama", "comedy", "action", "thriller", "science fiction",
@@ -308,7 +341,7 @@ def compute_profile(watched, metadata, jf_signals, ratings=None, now=None,
                 return value
         return pairs[-1][0]
 
-    binged, abandoned, favorites = [], [], []
+    binged, favorites = [], []
     if jf_signals:
         favorites = [t for t, s in jf_signals["movies"].items() if s["favorite"]]
         favorites += [t for t, s in jf_signals["series"].items() if s["favorite"]]
@@ -319,12 +352,11 @@ def compute_profile(watched, metadata, jf_signals, ratings=None, now=None,
                 continue
             completion = s["played"] / s["available"]
             first, last = _parse_jf_date(s["first"]), _parse_jf_date(s["last"])
+            # Fast, near-complete watch = strong positive. Low completion is NOT
+            # treated as a negative (see the note by BINGE_* — it's backlog).
             if (completion >= BINGE_COMPLETION and first and last
                     and (last - first) <= timedelta(days=BINGE_WINDOW_DAYS)):
                 binged.append(title)
-            elif (completion <= ABANDON_COMPLETION and last
-                    and (now - last) > timedelta(days=ABANDON_IDLE_DAYS)):
-                abandoned.append((title, completion))
 
     loved_titles, disliked_titles = [], []
     if ratings and len(ratings) >= MIN_RATINGS_TO_USE:
@@ -354,7 +386,6 @@ def compute_profile(watched, metadata, jf_signals, ratings=None, now=None,
                       sorted(rewatched, key=lambda r: (-r[0], r[1]))[:10]],
         "favorites": favorites[:10],
         "binged": binged[:8],
-        "abandoned": [t for t, _ in sorted(abandoned, key=lambda x: x[1])[:8]],
         "loved": [t for _, t in sorted(loved_titles, reverse=True)[:10]],
         "disliked": [t for _, t in sorted(disliked_titles)[:8]],
     }
@@ -367,8 +398,15 @@ def render_profile(profile):
     lines = [f"TASTE PROFILE (computed locally from {profile['sample_size']} "
              f"watched titles, recency-weighted — recent watching counts more):"]
     if profile["genres"]:
-        lines.append("- Genres watched most: " + ", ".join(
-            f"{g} ({share:.0%})" for g, share in profile["genres"]))
+        parts = []
+        for g, share, lift in profile["genres"]:
+            # Surface lift only when it's meaningfully above baseline — that's
+            # the "distinctive vs. the average viewer" signal worth flagging.
+            if lift and lift >= 1.3:
+                parts.append(f"{g} ({share:.0%}, {lift:.1f}× vs trending)")
+            else:
+                parts.append(f"{g} ({share:.0%})")
+        lines.append("- Genres watched most: " + ", ".join(parts))
     if profile["avoided_genres"]:
         lines.append("- Genres essentially never watched (do not suggest): "
                      + ", ".join(profile["avoided_genres"]))
@@ -393,14 +431,43 @@ def render_profile(profile):
         lines.append("- Marked favorite on the media server: " + ", ".join(profile["favorites"]))
     if profile["binged"]:
         lines.append("- Binged fast (strong likes): " + ", ".join(profile["binged"]))
-    if profile["abandoned"]:
-        lines.append("- Started but abandoned (avoid similar): " + ", ".join(profile["abandoned"]))
     if profile["loved"]:
         lines.append("- Personally rated 9-10: " + ", ".join(profile["loved"]))
     if profile["disliked"]:
         lines.append("- Personally rated 5 or below (avoid similar): "
                      + ", ".join(profile["disliked"]))
     return "\n".join(lines)
+
+
+# TMDB genre_id -> canonical name aligned with Trakt's normalized vocabulary
+# (lowercase, spaces). Covers both the movie and TV id sets; a couple of TV
+# combos ("Action & Adventure", "Sci-Fi & Fantasy") fold to their closest
+# Trakt genre so the baseline shares the user's vocabulary and lift lines up.
+_TMDB_GENRE_CANON = {
+    28: "action", 12: "adventure", 16: "animation", 35: "comedy",
+    80: "crime", 99: "documentary", 18: "drama", 10751: "family",
+    14: "fantasy", 36: "history", 27: "horror", 10402: "music",
+    9648: "mystery", 10749: "romance", 878: "science fiction",
+    53: "thriller", 10752: "war", 37: "western",
+    10759: "action", 10762: "family", 10763: "news", 10764: "reality",
+    10765: "science fiction", 10766: "soap", 10767: "talk show", 10768: "war",
+}
+
+
+def trending_genre_baseline(tmdb_get):
+    """Genre proportion of this week's TMDB trending — the population Gemini
+    draws from. Used as the lift baseline so the profile can flag what the
+    user over-indexes on. Empty dict if TMDB is unavailable (lift then off)."""
+    counts = defaultdict(float)
+    for tmdb_type in ("movie", "tv"):
+        data = tmdb_get(f"/trending/{tmdb_type}/week")
+        for entry in (data or {}).get("results", []):
+            for gid in entry.get("genre_ids") or []:
+                name = _TMDB_GENRE_CANON.get(gid)
+                if name:
+                    counts[name] += 1
+    total = sum(counts.values())
+    return {g: c / total for g, c in counts.items()} if total else {}
 
 
 # ============================================================
@@ -428,7 +495,8 @@ def build_and_render(conn, watched, tmdb_get, trakt_get, jellyfin_url,
                 ratings.extend(got)
 
         profile = compute_profile(watched, metadata, jf_signals, ratings,
-                                  half_life_days=half_life_days)
+                                  half_life_days=half_life_days,
+                                  baseline_genres=trending_genre_baseline(tmdb_get))
         if not profile["sample_size"]:
             return None
         return render_profile(profile)

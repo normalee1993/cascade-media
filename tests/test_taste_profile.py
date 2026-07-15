@@ -126,6 +126,10 @@ class ComputeProfileTests(unittest.TestCase):
 
 
 class PaceClassifierTests(unittest.TestCase):
+    """Only the positive binge signal survives. Low completion is NOT a
+    negative signal (this household's half-watched shows are backlog, not
+    dislikes), and there is no 'abandoned' key any more."""
+
     def _signals(self, available, played, first_days_ago, last_days_ago):
         return {"movies": {}, "series": {"S": {
             "available": available, "played": played, "favorite": False,
@@ -133,33 +137,28 @@ class PaceClassifierTests(unittest.TestCase):
             "last": (NOW - timedelta(days=last_days_ago)).isoformat(),
         }}}
 
-    def _classify(self, signals):
+    def _binged(self, signals):
         profile = taste_profile.compute_profile({"show": [], "movie": []}, {},
                                                 signals, now=NOW)
-        return profile["binged"], profile["abandoned"]
+        self.assertNotIn("abandoned", profile)  # negative signal is gone
+        return profile["binged"]
 
     def test_fast_complete_is_binged(self):
-        binged, abandoned = self._classify(self._signals(8, 8, 10, 5))
-        self.assertEqual(binged, ["S"])
-        self.assertEqual(abandoned, [])
+        self.assertEqual(self._binged(self._signals(8, 8, 10, 5)), ["S"])
 
-    def test_low_completion_long_idle_is_abandoned(self):
-        binged, abandoned = self._classify(self._signals(10, 3, 200, 90))
-        self.assertEqual(binged, [])
-        self.assertEqual(abandoned, ["S"])
+    def test_low_completion_long_idle_is_not_flagged(self):
+        """The old 'abandoned → avoid similar' case: must now produce nothing
+        (it's backlog, and the profile carries no negative for it)."""
+        self.assertEqual(self._binged(self._signals(10, 3, 200, 90)), [])
 
-    def test_recent_low_completion_is_neither(self):
-        """Still mid-watch (idle < ABANDON_IDLE_DAYS) must not be flagged."""
-        binged, abandoned = self._classify(self._signals(10, 3, 20, 5))
-        self.assertEqual((binged, abandoned), ([], []))
+    def test_recent_low_completion_is_not_binged(self):
+        self.assertEqual(self._binged(self._signals(10, 3, 20, 5)), [])
 
     def test_short_series_exempt(self):
-        binged, abandoned = self._classify(self._signals(3, 3, 10, 9))
-        self.assertEqual((binged, abandoned), ([], []))
+        self.assertEqual(self._binged(self._signals(3, 3, 10, 9)), [])
 
     def test_slow_complete_is_not_binged(self):
-        binged, abandoned = self._classify(self._signals(8, 8, 60, 5))
-        self.assertEqual((binged, abandoned), ([], []))
+        self.assertEqual(self._binged(self._signals(8, 8, 60, 5)), [])
 
 
 class MetadataCacheTests(unittest.TestCase):
@@ -223,6 +222,71 @@ class JellyfinUserResolutionTests(unittest.TestCase):
                 taste_profile.resolve_jellyfin_user("http://jf", "k", "nobody"))
 
 
+class GenreLiftTests(unittest.TestCase):
+    """Lift vs. a baseline population — the 'what's distinctive' signal."""
+
+    def test_lift_computed_against_baseline(self):
+        # 3 crime + 1 drama watched; baseline is drama-heavy, crime-light.
+        watched = {"movie": [_watched("movie", f"C{i}", genres=("crime",))
+                             for i in range(3)]
+                   + [_watched("movie", "D", genres=("drama",))], "show": []}
+        baseline = {"crime": 0.1, "drama": 0.6}
+        profile = taste_profile.compute_profile(watched, {}, None, now=NOW,
+                                                baseline_genres=baseline)
+        genres = {g: lift for g, _, lift in profile["genres"]}
+        # crime: user share .75 vs baseline .10 -> big lift; drama below baseline
+        self.assertGreater(genres["crime"], 2.0)
+        self.assertLess(genres["drama"], 1.0)
+
+    def test_lift_none_without_baseline(self):
+        watched = {"movie": [_watched("movie", "C", genres=("crime",))], "show": []}
+        profile = taste_profile.compute_profile(watched, {}, None, now=NOW)
+        self.assertTrue(all(lift is None for _, _, lift in profile["genres"]))
+
+    def test_render_shows_lift_only_when_distinctive(self):
+        watched = {"movie": [_watched("movie", f"C{i}", genres=("crime",))
+                             for i in range(3)], "show": []}
+        text = taste_profile.render_profile(
+            taste_profile.compute_profile(watched, {}, None, now=NOW,
+                                          baseline_genres={"crime": 0.05}))
+        self.assertIn("× vs trending", text)
+
+    def test_trending_baseline_maps_tmdb_ids(self):
+        def fake_tmdb(endpoint, params=None):
+            if endpoint.endswith("movie/week"):
+                return {"results": [{"genre_ids": [80, 18]}]}  # crime, drama
+            return {"results": [{"genre_ids": [10765]}]}       # tv sci-fi&fantasy
+        base = taste_profile.trending_genre_baseline(fake_tmdb)
+        self.assertAlmostEqual(base["crime"], 1/3)
+        self.assertAlmostEqual(base["science fiction"], 1/3)
+
+
+class JellyfinSignalsTests(unittest.TestCase):
+    """fetch_jellyfin_signals — null-Name guard + show-level favorite seeding."""
+
+    def _responses(self, movies, episodes, series):
+        payloads = {"Movie": movies, "Episode": episodes, "Series": series}
+        def fake(url, key, endpoint, params=None):
+            return {"Items": payloads[params["IncludeItemTypes"]]}
+        return fake
+
+    def test_nameless_movie_skipped(self):
+        movies = [{"UserData": {"PlayCount": 2, "IsFavorite": True}},   # no Name
+                  {"Name": "Heat", "UserData": {"PlayCount": 3}}]
+        with patch.object(taste_profile, "_jellyfin_get",
+                          side_effect=self._responses(movies, [], [])):
+            sig = taste_profile.fetch_jellyfin_signals("http://jf", "k", "uid")
+        self.assertEqual(list(sig["movies"]), ["Heat"])   # None key never stored
+
+    def test_show_level_favorite_seeded(self):
+        episodes = [{"SeriesName": "Dexter", "UserData": {"Played": True}}]
+        series = [{"Name": "Dexter", "UserData": {"IsFavorite": True}}]
+        with patch.object(taste_profile, "_jellyfin_get",
+                          side_effect=self._responses([], episodes, series)):
+            sig = taste_profile.fetch_jellyfin_signals("http://jf", "k", "uid")
+        self.assertTrue(sig["series"]["Dexter"]["favorite"])
+
+
 class RenderProfileTests(unittest.TestCase):
     def test_renders_only_populated_sections(self):
         profile = taste_profile.compute_profile(
@@ -233,6 +297,7 @@ class RenderProfileTests(unittest.TestCase):
         self.assertIn("crime", text)
         self.assertNotIn("Binged fast", text)
         self.assertNotIn("Rewatched", text)
+        self.assertNotIn("abandoned", text.lower())
 
 
 class OrchestratorTests(unittest.TestCase):
