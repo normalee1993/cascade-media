@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Scheduler with webhook support for media automation."""
 
+import base64
+import hmac
 import time
 import os
 import logging
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -12,9 +15,12 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, urlsplit
 import json
 
 import requests
+
+from security_utils import safe_log
 
 # The playback check now runs IN-PROCESS in playback_check_loop (no subprocess
 # per interval). media_automation owns all the playback logic; the scheduler
@@ -101,9 +107,28 @@ _live_children = set()
 # Max request body we will read from a webhook client. Sonarr's SeriesAdd payloads
 # are a few KiB; anything past this is almost certainly malformed/hostile.
 MAX_WEBHOOK_BODY = 1 * 1024 * 1024  # 1 MiB
-# Per-request socket timeout so a half-open / slow-loris connection can't pin a
-# handler thread forever.
+# Per-socket-operation timeout AND whole-connection deadline (seconds). The
+# socket timeout alone resets on every recv, so a client dripping one byte per
+# 29s would hold a handler forever; WebhookHandler.setup() also arms a timer
+# that tears the connection down once this many seconds have elapsed in total.
 WEBHOOK_REQUEST_TIMEOUT = 30
+# Concurrent webhook connections. Each connection can make http.server buffer
+# up to ~6.5 MB of headers before our code runs, so the cap bounds that memory
+# (8 x 6.5 MB ~= 52 MB, well inside the 256m container limit). Sonarr sends one
+# webhook at a time; the HEALTHCHECK needs one more slot.
+MAX_WEBHOOK_CONNECTIONS = max(2, get_int_env("MAX_WEBHOOK_CONNECTIONS", 8))
+# Distinct series that may be waiting for a webhook worker. Re-sends of an
+# already-queued series are deduplicated; beyond this the server answers 503 so
+# a flood can't grow the executor's (unbounded) work queue without limit.
+MAX_PENDING_WEBHOOKS = max(1, get_int_env("MAX_PENDING_WEBHOOKS", 50))
+# Sonarr series ids are positive 32-bit ints.
+MAX_SERIES_ID = 2**31 - 1
+
+# Shared secret required on every webhook POST. Sonarr sends it either as the
+# webhook connection's Basic-auth password (Settings > Connect > Webhook >
+# Password) or as ?token=<secret> on the webhook URL. Unset = webhooks are
+# REFUSED (403) — the 15-minute poll still picks up new series, just later.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 # Thread pool for webhook handling
 webhook_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="webhook")
@@ -190,10 +215,83 @@ def run_webhook_script(series_id):
         return False
 
 
+# Series ids accepted by the webhook and not yet finished. Dedupes bursts of the
+# same SeriesAdd and bounds the executor's work queue (see MAX_PENDING_WEBHOOKS).
+_pending_lock = threading.Lock()
+_pending_series = set()
+
+
+def enqueue_webhook_series(series_id):
+    """Queue a validated series id for processing.
+
+    Returns "queued", "already_queued" (same id still pending — deduplicated) or
+    "full" (MAX_PENDING_WEBHOOKS distinct ids already waiting).
+    """
+    with _pending_lock:
+        if series_id in _pending_series:
+            return "already_queued"
+        if len(_pending_series) >= MAX_PENDING_WEBHOOKS:
+            return "full"
+        _pending_series.add(series_id)
+    try:
+        webhook_executor.submit(process_webhook_series, series_id)
+    except Exception:
+        # Executor shut down (container stopping) — don't leak the pending slot.
+        with _pending_lock:
+            _pending_series.discard(series_id)
+        raise
+    return "queued"
+
+
 def process_webhook_series(series_id):
     """Process a webhook series - runs independently from the poll script."""
-    log.info(f"Webhook: queuing series {series_id} for processing")
-    run_webhook_script(series_id)
+    try:
+        log.info(f"Webhook: queuing series {series_id} for processing")
+        run_webhook_script(series_id)
+    finally:
+        with _pending_lock:
+            _pending_series.discard(series_id)
+
+
+def _valid_series_id(value):
+    """Sonarr series ids are positive ints; reject bools, strings, floats, huge ints."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= MAX_SERIES_ID)
+
+
+def check_webhook_auth(headers, path, secret=None):
+    """Authorize a webhook request. Returns None if allowed, else an HTTP status.
+
+    403 when no WEBHOOK_SECRET is configured (webhooks disabled until it is);
+    401 when the request carries no / the wrong secret. The secret is accepted as
+    the Basic-auth password (or username, if the password field was left empty)
+    or as ?token=<secret> in the URL. Constant-time comparison throughout.
+    """
+    secret = WEBHOOK_SECRET if secret is None else secret
+    if not secret:
+        return 403
+    expected = secret.encode("utf-8")
+    candidates = []
+
+    auth = headers.get("Authorization") or ""
+    scheme, _, value = auth.partition(" ")
+    if scheme.lower() == "basic" and value:
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+            user, _, password = decoded.partition(":")
+            candidates.extend([password, user])
+        except (ValueError, UnicodeDecodeError):
+            pass
+    elif scheme.lower() == "bearer" and value:
+        candidates.append(value.strip())
+
+    query = parse_qs(urlsplit(path or "").query)
+    candidates.extend(query.get("token", [])[:1])
+
+    for candidate in candidates:
+        if candidate and hmac.compare_digest(candidate.encode("utf-8"), expected):
+            return None
+    return 401
 
 
 class BadContentLength(Exception):
@@ -227,16 +325,61 @@ def read_request_body(headers, rfile, max_bytes=MAX_WEBHOOK_BODY):
 class WebhookHandler(BaseHTTPRequestHandler):
     """Handle incoming webhooks from Sonarr."""
 
-    # Per-request socket timeout (used by BaseHTTPRequestHandler.handle / setup).
-    # A half-open or slow client gets its socket torn down instead of pinning a
-    # handler thread indefinitely.
+    # Per-socket-operation timeout (applied by StreamRequestHandler.setup). This
+    # resets on every recv, so setup() below also arms a whole-connection
+    # deadline — together a slow-loris client can hold a slot for at most
+    # WEBHOOK_REQUEST_TIMEOUT seconds.
     timeout = WEBHOOK_REQUEST_TIMEOUT
+
+    def setup(self):
+        super().setup()
+        self._deadline_timer = threading.Timer(WEBHOOK_REQUEST_TIMEOUT, self._expire_connection)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _expire_connection(self):
+        """Deadline hit: shut the socket so any blocked read in this handler
+        returns immediately and the thread (and its connection slot) is freed."""
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        timer = getattr(self, "_deadline_timer", None)
+        if timer is not None:
+            timer.cancel()
+        try:
+            super().finish()
+        except OSError:
+            pass  # socket already torn down by the deadline timer
 
     def do_POST(self):
         """Handle POST requests (Sonarr webhooks)."""
-        # Parse Content-Length and read the body INSIDE the try so a malformed or
-        # oversized header returns a clean 400/413 instead of an unhandled traceback.
         try:
+            # Authorize BEFORE reading the body: unauthenticated clients get no
+            # further than the headers (S1/S2 hardening).
+            denied = check_webhook_auth(self.headers, getattr(self, "path", "/"))
+            if denied == 403:
+                _warn_webhook_secret_unset()
+                self._respond(403, {"status": "error", "message": "webhooks disabled: WEBHOOK_SECRET not set"})
+                return
+            if denied == 401:
+                log.warning("Webhook rejected: missing or invalid secret")
+                self._respond(401, {"status": "error", "message": "unauthorized"},
+                              extra_headers={"WWW-Authenticate": 'Basic realm="cascade-media"'})
+                return
+
+            # Sonarr always sends application/json. Requiring it also defeats
+            # cross-site "simple" text/plain form posts from a browser.
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                log.warning(f"Webhook rejected: unsupported Content-Type {safe_log(content_type, 60)!r}")
+                self._respond(415, {"status": "error", "message": "Content-Type must be application/json"})
+                return
+
+            # Parse Content-Length and read the body so a malformed or oversized
+            # header returns a clean 400/413 instead of an unhandled traceback.
             try:
                 body = read_request_body(self.headers, self.rfile)
             except BadContentLength as e:
@@ -248,50 +391,137 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._respond(413, {"status": "error", "message": "request body too large"})
                 return
 
-            data = json.loads(body) if body else {}
+            try:
+                data = json.loads(body) if body else {}
+            except (ValueError, UnicodeDecodeError):
+                log.warning("Webhook rejected: body is not valid JSON")
+                self._respond(400, {"status": "error", "message": "invalid JSON"})
+                return
+            if not isinstance(data, dict):
+                self._respond(400, {"status": "error", "message": "JSON body must be an object"})
+                return
+
             event_type = data.get("eventType", "unknown")
-            series_data = data.get("series", {})
+            series_data = data.get("series")
+            if not isinstance(series_data, dict):
+                series_data = {}
             series_title = series_data.get("title", "unknown")
             series_id = series_data.get("id")
 
-            log.info(f"Webhook received: {event_type} for '{series_title}' (ID: {series_id})")
+            log.info(f"Webhook received: {safe_log(event_type, 40)} for "
+                     f"'{safe_log(series_title, 120)}' (ID: {safe_log(series_id, 20)})")
 
-            if event_type == "SeriesAdd" and series_id:
-                # Process this series independently from the poll script
-                log.info(f"SeriesAdd detected - scheduling series {series_id}")
-                webhook_executor.submit(process_webhook_series, series_id)
-                self._respond(200, {"status": "triggered", "seriesId": series_id})
+            if event_type == "SeriesAdd":
+                if not _valid_series_id(series_id):
+                    log.warning(f"Webhook rejected: invalid series id {safe_log(series_id, 20)}")
+                    self._respond(400, {"status": "error", "message": "series.id must be a positive integer"})
+                    return
+                outcome = enqueue_webhook_series(series_id)
+                if outcome == "full":
+                    log.warning(f"Webhook queue full ({MAX_PENDING_WEBHOOKS} pending); "
+                                f"series {series_id} left for the next poll")
+                    self._respond(503, {"status": "busy", "seriesId": series_id})
+                elif outcome == "already_queued":
+                    log.info(f"Series {series_id} already queued; ignoring duplicate webhook")
+                    self._respond(200, {"status": "already_queued", "seriesId": series_id})
+                else:
+                    # Process this series independently from the poll script
+                    log.info(f"SeriesAdd detected - scheduling series {series_id}")
+                    self._respond(200, {"status": "triggered", "seriesId": series_id})
 
             elif event_type == "Test":
                 self._respond(200, {"status": "ok"})
 
             elif event_type == "Grab":
                 # Grab events don't need immediate processing
-                log.info(f"Grab event for '{series_title}', will be handled by next poll")
+                log.info(f"Grab event for '{safe_log(series_title, 120)}', will be handled by next poll")
                 self._respond(200, {"status": "noted"})
 
             else:
-                log.info(f"Ignoring event type: {event_type}")
+                log.info(f"Ignoring event type: {safe_log(event_type, 40)}")
                 self._respond(200, {"status": "ignored"})
 
         except Exception as e:
-            log.error(f"Webhook error: {e}", exc_info=True)
-            self._respond(500, {"status": "error", "message": str(e)})
+            log.error(f"Webhook error: {safe_log(e)}", exc_info=True)
+            # Generic message: exception text may describe internals.
+            self._respond(500, {"status": "error", "message": "internal error"})
 
     def do_GET(self):
-        """Health check endpoint."""
+        """Health check endpoint. 503 while the in-process playback loop is
+        stalled, so Docker's HEALTHCHECK marks the container unhealthy."""
+        if playback_loop_stalled():
+            self._respond(503, {"status": "degraded", "playback_loop": "stalled"})
+            return
         self._respond(200, {"status": "running"})
 
-    def _respond(self, code, data):
+    def _respond(self, code, data, extra_headers=None):
         """Send a JSON response."""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
     def log_message(self, format, *args):
         """Suppress default HTTP logging — we use our own."""
         pass
+
+
+_secret_warning_lock = threading.Lock()
+_secret_warning_last = [0.0]
+
+
+def _warn_webhook_secret_unset():
+    """Log the 'webhooks disabled' explanation at most once per 10 minutes."""
+    now = time.monotonic()
+    with _secret_warning_lock:
+        if _secret_warning_last[0] and now - _secret_warning_last[0] < 600:
+            return
+        _secret_warning_last[0] = now
+    log.error("Webhook refused: WEBHOOK_SECRET is not set. Set WEBHOOK_SECRET in the "
+              "container env and the same value as the Password of Sonarr's webhook "
+              "connection (Settings > Connect > Webhook). Until then new series are "
+              "picked up by the regular poll instead.")
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a cap on concurrent connections.
+
+    The stock server starts one thread per connection with no limit, so a flood
+    of slow or header-heavy connections could exhaust threads and memory. Excess
+    connections are closed immediately; slots are released when the handler
+    thread finishes (including after a deadline-forced teardown).
+    """
+
+    daemon_threads = True
+
+    def __init__(self, server_address, handler_class, max_connections=None):
+        self.max_connections = max_connections or MAX_WEBHOOK_CONNECTIONS
+        self._conn_slots = threading.BoundedSemaphore(self.max_connections)
+        self._last_reject_log = 0.0
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._conn_slots.acquire(blocking=False):
+            now = time.monotonic()
+            if now - self._last_reject_log > 60:
+                self._last_reject_log = now
+                log.warning(f"Webhook server at its {self.max_connections}-connection cap; "
+                            f"dropping new connections")
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_slots.release()
 
 
 def start_webhook_server(server):
@@ -329,7 +559,58 @@ def run_trakt_script(args=None):
         trakt_lock.release()
 
 
-def playback_check_loop():
+# Playback-loop watchdog state. The in-process loop has no subprocess hard
+# timeout, and requests' timeout=30 is per-read, so a slow-drip upstream response
+# can block the loop thread indefinitely. The loop stamps a heartbeat after each
+# iteration; playback_watchdog_loop() restarts a stalled loop under a new
+# generation number (the stale thread exits if it ever wakes) and do_GET reports
+# 503 while it is stalled so the container shows unhealthy.
+PLAYBACK_STALL_SECONDS = max(10 * PLAYBACK_CHECK_INTERVAL, 15 * 60)
+_playback_state_lock = threading.Lock()
+_playback_state = {"heartbeat": None, "generation": 0, "disabled": False}
+
+
+def _playback_heartbeat():
+    with _playback_state_lock:
+        _playback_state["heartbeat"] = time.monotonic()
+
+
+def playback_loop_stalled(now=None):
+    """True if the playback loop is running but hasn't finished an iteration
+    within PLAYBACK_STALL_SECONDS."""
+    now = time.monotonic() if now is None else now
+    with _playback_state_lock:
+        hb = _playback_state["heartbeat"]
+        if hb is None or _playback_state["disabled"]:
+            return False
+        return now - hb > PLAYBACK_STALL_SECONDS
+
+
+def _start_playback_thread():
+    """Start a fresh playback loop under a new generation; returns the thread."""
+    with _playback_state_lock:
+        _playback_state["generation"] += 1
+        generation = _playback_state["generation"]
+        _playback_state["heartbeat"] = time.monotonic()
+    thread = threading.Thread(target=playback_check_loop, args=(generation,),
+                              daemon=True, name=f"playback-{generation}")
+    thread.start()
+    return thread
+
+
+def playback_watchdog_loop(check_every=60):
+    """Restart the playback loop if it stalls (S40)."""
+    while not shutdown_event.wait(check_every):
+        if playback_loop_stalled():
+            with _playback_state_lock:
+                stale_for = time.monotonic() - (_playback_state["heartbeat"] or 0)
+            log.error(f"Playback check loop stalled for {stale_for:.0f}s "
+                      f"(limit {PLAYBACK_STALL_SECONDS}s) — likely a hung upstream "
+                      f"request. Starting a fresh loop.")
+            _start_playback_thread()
+
+
+def playback_check_loop(generation=None):
     """Background loop that checks for active playback every N seconds — IN-PROCESS.
 
     Previously each interval shelled out to a fresh `python media_automation.py
@@ -347,9 +628,19 @@ def playback_check_loop():
         freezing this thread / delaying container shutdown.
       - The per-iteration call is wrapped in try/except so any playback failure
         is logged and the loop continues — it must NEVER crash the scheduler.
-      - We accept the loss of the old 600s subprocess hard-timeout: every wait is
-        now bounded + interruptible and every API call carries timeout=30.
+      - The old 600s subprocess hard-timeout is gone, and timeout=30 is only a
+        per-read timeout, so a slow-drip upstream can still block a call. Each
+        iteration stamps a heartbeat; playback_watchdog_loop() replaces a stalled
+        loop (new `generation`) and this thread exits if it ever wakes up stale.
     """
+    if generation is None:
+        with _playback_state_lock:
+            generation = _playback_state["generation"]
+
+    def _current():
+        with _playback_state_lock:
+            return _playback_state["generation"] == generation
+
     log.info(f"Playback check loop started (interval: {PLAYBACK_CHECK_INTERVAL}s, in-process)")
 
     # Long-lived resources owned solely by this loop thread.
@@ -359,10 +650,12 @@ def playback_check_loop():
         conn = media_automation.init_db()
         if not media_automation.check_db_writable(conn):
             log.error("Playback loop: DB not writable; playback checks disabled this run")
+            with _playback_state_lock:
+                _playback_state["disabled"] = True  # don't let the watchdog respawn it
             return  # finally closes conn
         session = requests.Session()
 
-        while not shutdown_event.is_set():
+        while not shutdown_event.is_set() and _current():
             try:
                 media_automation.check_active_playback(
                     conn, session=session, stop_event=shutdown_event
@@ -370,6 +663,10 @@ def playback_check_loop():
             except Exception as e:
                 # Error boundary: a playback failure must never crash the scheduler.
                 log.error(f"Error in playback check loop: {e}", exc_info=True)
+            if not _current():
+                log.warning("Stale playback loop woke up after being replaced; exiting")
+                break
+            _playback_heartbeat()
             # wait() returns True if event was set during the wait — break promptly on SIGTERM
             if shutdown_event.wait(PLAYBACK_CHECK_INTERVAL):
                 break
@@ -444,9 +741,13 @@ def _handle_shutdown_signal(signum, frame):
 
 
 def main():
+    # Files we create (SQLite DB + WAL, Trakt tokens, AI artifacts) must not be
+    # world-readable; children inherit this umask. Group stays rw for Unraid's
+    # 'users' group (S25).
+    os.umask(0o007)
     log.info(f"Media Automation Scheduler started")
     log.info(f"  Polling interval: {INTERVAL_MINUTES} minutes")
-    log.info(f"  Webhook port: {WEBHOOK_PORT}")
+    log.info(f"  Webhook port: {WEBHOOK_PORT} (auth: {'secret required' if WEBHOOK_SECRET else 'DISABLED - WEBHOOK_SECRET unset'})")
     log.info(f"  Playback check interval: {PLAYBACK_CHECK_INTERVAL}s")
     log.info(f"  Script timeout: {SCRIPT_TIMEOUT}s")
     log.info(f"  Trakt discovery: {'enabled' if TRAKT_DISCOVERY_ENABLED else 'disabled'}")
@@ -461,14 +762,19 @@ def main():
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
     # Build webhook server up front so we hold a reference for .shutdown().
-    # ThreadingHTTPServer handles each request in its own thread, so one slow or
-    # stuck client can't block health checks (do_GET) or other webhooks. The worker
-    # threads are daemons (daemon_threads=True) so a pending request can't block a
-    # clean process exit.
+    # BoundedThreadingHTTPServer handles each request in its own (daemon) thread,
+    # so one slow client can't block health checks or other webhooks, while the
+    # connection cap + per-connection deadline stop a flood from exhausting
+    # threads or memory.
+    if not WEBHOOK_SECRET:
+        log.error("WEBHOOK_SECRET is not set: Sonarr webhooks will be REFUSED (403). "
+                  "Set WEBHOOK_SECRET and put the same value in the Password field of "
+                  "Sonarr's webhook connection. New series are still picked up by the "
+                  f"{INTERVAL_MINUTES}-minute poll.")
+
     webhook_server = None
     try:
-        webhook_server = ThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
-        webhook_server.daemon_threads = True
+        webhook_server = BoundedThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
     except OSError as e:
         log.error(f"Failed to start webhook server on port {WEBHOOK_PORT}: {e}")
         log.error("Continuing with polling-only mode")
@@ -479,9 +785,9 @@ def main():
         )
         webhook_thread.start()
 
-    # Start playback check loop in background
-    playback_thread = threading.Thread(target=playback_check_loop, daemon=True)
-    playback_thread.start()
+    # Start playback check loop in background, plus its stall watchdog
+    _start_playback_thread()
+    threading.Thread(target=playback_watchdog_loop, daemon=True, name="playback-watchdog").start()
 
     # Start Trakt discovery loop if enabled
     if TRAKT_DISCOVERY_ENABLED:

@@ -576,16 +576,24 @@ class SchedulerWebhookHardeningTests(unittest.TestCase):
 
     # ---- do_POST behavior via a handler built without a real socket ----
 
+    def setUp(self):
+        # These tests exercise body handling, so they run authorized: a secret
+        # is configured and every request carries it via ?token=.
+        patcher = patch.object(scheduler, "WEBHOOK_SECRET", "s3cret")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _make_handler(self, headers, rfile):
         """Build a WebhookHandler without invoking BaseHTTPRequestHandler.__init__
         (which would try to service a real connection). We only need the do_POST
         path, so we attach the attributes it touches and capture _respond calls."""
         handler = scheduler.WebhookHandler.__new__(scheduler.WebhookHandler)
-        handler.headers = headers
+        handler.headers = {"Content-Type": "application/json", **headers}
+        handler.path = "/?token=s3cret"
         handler.rfile = rfile
         handler.wfile = io.BytesIO()
         handler._responses = []
-        handler._respond = lambda code, data: handler._responses.append((code, data))
+        handler._respond = lambda code, data, extra_headers=None: handler._responses.append((code, data))
         return handler
 
     def test_do_post_malformed_length_returns_400(self):
@@ -600,15 +608,15 @@ class SchedulerWebhookHardeningTests(unittest.TestCase):
         handler.do_POST()
         self.assertEqual(handler._responses[-1][0], 413)
 
-    def test_do_post_malformed_json_returns_500_not_crash(self):
-        """Valid Content-Length but non-JSON body falls into the catch-all and
-        returns 500 — must not raise out of the handler."""
+    def test_do_post_malformed_json_returns_400_not_crash(self):
+        """Valid Content-Length but non-JSON body is a client error (400) and
+        must not raise out of the handler."""
         payload = b"this is not json{{{"
         handler = self._make_handler(
             {"Content-Length": str(len(payload))}, io.BytesIO(payload)
         )
         handler.do_POST()
-        self.assertEqual(handler._responses[-1][0], 500)
+        self.assertEqual(handler._responses[-1][0], 400)
 
     def test_do_post_test_event_returns_200(self):
         payload = b'{"eventType":"Test"}'
@@ -623,7 +631,8 @@ class SchedulerWebhookHardeningTests(unittest.TestCase):
         handler carries a per-request timeout so a half-open socket can't pin a
         thread forever."""
         from http.server import ThreadingHTTPServer
-        self.assertIs(scheduler.ThreadingHTTPServer, ThreadingHTTPServer)
+        self.assertTrue(issubclass(scheduler.BoundedThreadingHTTPServer, ThreadingHTTPServer))
+        self.assertTrue(scheduler.BoundedThreadingHTTPServer.daemon_threads)
         self.assertEqual(scheduler.WebhookHandler.timeout, scheduler.WEBHOOK_REQUEST_TIMEOUT)
 
 
@@ -920,6 +929,18 @@ class AtomicClaimTests(unittest.TestCase):
             {"id": 3, "seasonNumber": 2, "episodeNumber": 1, "monitored": True, "hasFile": False},
         ]
 
+    def _live(self):
+        """Run process_new_series for real against mocks: DRY_RUN off (dry runs
+        now write no state — S38), with sleeps, searches and queue cleanup
+        stubbed so the claim state machine is what's under test."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch.object(media_automation, "DRY_RUN", False))
+        stack.enter_context(patch.object(media_automation.time, "sleep"))
+        stack.enter_context(patch.object(media_automation, "sonarr_post"))
+        stack.enter_context(patch.object(media_automation, "cleanup_unwanted_queue_items", return_value=0))
+        return stack
+
     def test_failed_apply_monitoring_leaves_series_reclaimable_and_retries(self):
         """P1-2 durability fix: if apply_monitoring raises, the claim is released
         (not flagged 'done'), so the series is re-claimable and the NEXT run
@@ -927,7 +948,7 @@ class AtomicClaimTests(unittest.TestCase):
         conn = self._new_conn()
         try:
             series = self._series()
-            with patch.object(media_automation, "DRY_RUN", True), \
+            with self._live(), \
                  patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
                  patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
                  patch.object(media_automation, "apply_monitoring",
@@ -941,7 +962,7 @@ class AtomicClaimTests(unittest.TestCase):
                               "failed setup must release the claim row entirely")
 
             # Next run succeeds → ends 'done', and apply_monitoring/searches ran.
-            with patch.object(media_automation, "DRY_RUN", True), \
+            with self._live(), \
                  patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
                  patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
                  patch.object(media_automation, "apply_monitoring") as good_apply:
@@ -957,7 +978,7 @@ class AtomicClaimTests(unittest.TestCase):
         conn = self._new_conn()
         try:
             series = self._series(sonarr_id=23, title="Happy Show")
-            with patch.object(media_automation, "DRY_RUN", True), \
+            with self._live(), \
                  patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
                  patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
                  patch.object(media_automation, "apply_monitoring", return_value=0):
@@ -977,7 +998,7 @@ class AtomicClaimTests(unittest.TestCase):
             series = self._series(sonarr_id=25, title="Inflight Show")
             # Pre-existing fresh in_progress claim by a "different process".
             media_automation.claim_series_for_processing(conn, 25, "Inflight Show")
-            with patch.object(media_automation, "DRY_RUN", True), \
+            with self._live(), \
                  patch.object(media_automation, "sonarr_get", return_value=self._episodes()), \
                  patch.object(media_automation, "get_requested_seasons_from_seerr", return_value={1}), \
                  patch.object(media_automation, "apply_monitoring") as apply_mock:
