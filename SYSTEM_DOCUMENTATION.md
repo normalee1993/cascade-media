@@ -39,7 +39,7 @@ Sonarr → Settings → Connect → add a new **Webhook**:
 
 Without this, new series in Sonarr are only picked up by the next poll (`RUN_INTERVAL_MINUTES`). Without `WEBHOOK_SECRET` set, every webhook is answered 403 — same effect.
 
-Webhook server hardening (v1.11.0): auth checked before the body is read (401 wrong/missing secret, 403 none configured); `Content-Type: application/json` required (415 otherwise — blocks cross-site form posts); `series.id` must be a positive 32-bit int (400); already-queued ids are deduplicated and at most `MAX_PENDING_WEBHOOKS` (50) distinct series wait for a worker (503 beyond); at most `MAX_WEBHOOK_CONNECTIONS` (8) concurrent connections, each torn down after 30 s total; all logged fields are control-character-escaped and truncated.
+Webhook server hardening (v1.11.0): auth checked before the body is read (401 wrong/missing secret, 403 none configured); `Content-Type: application/json` required (415 otherwise — blocks cross-site form posts); `series.id` must be a positive 32-bit int (400); already-queued ids are deduplicated and at most `MAX_PENDING_WEBHOOKS` (50) distinct series wait for a worker (503 beyond); request line + headers limited to 32 KiB (431); at most `MAX_WEBHOOK_CONNECTIONS` (8) concurrent connections, each torn down after 30 s total; all logged fields are control-character-escaped and truncated.
 
 ### 2. Jellyseerr/Overseerr → "Enable Automatic Search" UNCHECKED
 

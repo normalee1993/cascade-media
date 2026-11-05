@@ -185,6 +185,35 @@ class ConnectionCapTests(_LiveServer):
             self.assertEqual(status, 200)
 
 
+class HeaderBudgetTests(_LiveServer):
+    def test_oversized_headers_get_431_without_buffering(self):
+        """Stock http.server would buffer ~6.5 MB of headers per connection; the
+        budget cuts it off at MAX_HEADER_BYTES and answers 431."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")
+            try:
+                for i in range(40):
+                    sock.sendall(f"X-Pad-{i}: ".encode() + b"A" * 60_000 + b"\r\n")
+                sock.sendall(b"\r\n")
+            except OSError:
+                pass  # server stopped reading once the budget was spent
+            reply = b""
+            try:
+                while chunk := sock.recv(4096):
+                    reply += chunk
+            except OSError:
+                pass
+        finally:
+            sock.close()
+        self.assertIn(b" 431 ", reply.split(b"\r\n", 1)[0])
+        scheduler.webhook_executor.submit.assert_not_called()
+
+    def test_normal_headers_unaffected(self):
+        status, _ = self.post({"eventType": "Test"}, headers=self.basic(SECRET))
+        self.assertEqual(status, 200)
+
+
 class ConnectionDeadlineTests(_LiveServer):
     def test_slow_drip_client_is_cut_off_at_deadline(self):
         with patch.object(scheduler, "WEBHOOK_REQUEST_TIMEOUT", 1), \

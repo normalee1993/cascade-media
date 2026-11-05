@@ -112,10 +112,13 @@ MAX_WEBHOOK_BODY = 1 * 1024 * 1024  # 1 MiB
 # 29s would hold a handler forever; WebhookHandler.setup() also arms a timer
 # that tears the connection down once this many seconds have elapsed in total.
 WEBHOOK_REQUEST_TIMEOUT = 30
-# Concurrent webhook connections. Each connection can make http.server buffer
-# up to ~6.5 MB of headers before our code runs, so the cap bounds that memory
-# (8 x 6.5 MB ~= 52 MB, well inside the 256m container limit). Sonarr sends one
-# webhook at a time; the HEALTHCHECK needs one more slot.
+# Request line + headers may total at most this many bytes. Stock http.server
+# accepts ~100 headers x 64 KiB (~6.5 MB raw, ~20 MB once parsed) per connection
+# before our code runs; Sonarr's headers are well under 2 KiB. Over budget -> 431.
+MAX_HEADER_BYTES = 32 * 1024
+# Concurrent webhook connections. With the header budget above, each connection
+# costs at most ~MAX_HEADER_BYTES + MAX_WEBHOOK_BODY, so the cap bounds total
+# memory. Sonarr sends one webhook at a time; the HEALTHCHECK needs one more slot.
 MAX_WEBHOOK_CONNECTIONS = max(2, get_int_env("MAX_WEBHOOK_CONNECTIONS", 8))
 # Distinct series that may be waiting for a webhook worker. Re-sends of an
 # already-queued series are deduplicated; beyond this the server answers 503 so
@@ -322,6 +325,33 @@ def read_request_body(headers, rfile, max_bytes=MAX_WEBHOOK_BODY):
     return rfile.read(content_length) if content_length else b""
 
 
+class _HeaderBudgetReader:
+    """Wraps the handler's rfile so readline() — used only for the request line
+    and headers — can return at most `budget` bytes in total. Once exhausted it
+    returns b"" (http.client then stops reading headers) and sets .overflowed so
+    the handler answers 431. read() (the body, already capped by Content-Length
+    and MAX_WEBHOOK_BODY) is passed through unchanged."""
+
+    def __init__(self, raw, budget):
+        self._raw = raw
+        self._remaining = budget
+        self.overflowed = False
+
+    def readline(self, size=-1):
+        if self._remaining <= 0:
+            self.overflowed = True
+            return b""
+        limit = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        line = self._raw.readline(limit)
+        self._remaining -= len(line)
+        if self._remaining <= 0 and not line.endswith(b"\n"):
+            self.overflowed = True
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     """Handle incoming webhooks from Sonarr."""
 
@@ -333,6 +363,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
+        self.rfile = _HeaderBudgetReader(self.rfile, MAX_HEADER_BYTES)
         self._deadline_timer = threading.Timer(WEBHOOK_REQUEST_TIMEOUT, self._expire_connection)
         self._deadline_timer.daemon = True
         self._deadline_timer.start()
@@ -354,8 +385,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
         except OSError:
             pass  # socket already torn down by the deadline timer
 
+    def _headers_overflowed(self):
+        if getattr(getattr(self, "rfile", None), "overflowed", False) is True:
+            self._respond(431, {"status": "error", "message": "request headers too large"})
+            return True
+        return False
+
     def do_POST(self):
         """Handle POST requests (Sonarr webhooks)."""
+        if self._headers_overflowed():
+            return
         try:
             # Authorize BEFORE reading the body: unauthenticated clients get no
             # further than the headers (S1/S2 hardening).
@@ -449,19 +488,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Health check endpoint. 503 while the in-process playback loop is
         stalled, so Docker's HEALTHCHECK marks the container unhealthy."""
+        if self._headers_overflowed():
+            return
         if playback_loop_stalled():
             self._respond(503, {"status": "degraded", "playback_loop": "stalled"})
             return
         self._respond(200, {"status": "running"})
 
     def _respond(self, code, data, extra_headers=None):
-        """Send a JSON response."""
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        for name, value in (extra_headers or {}).items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        """Send a JSON response. A client that already hung up (or a connection
+        torn down by the deadline) is ignored rather than producing a traceback
+        per connection — otherwise a flood of drop-and-run clients floods stderr."""
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
 
     def log_message(self, format, *args):
         """Suppress default HTTP logging — we use our own."""
