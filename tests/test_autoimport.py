@@ -158,18 +158,17 @@ class SonarrResolveTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_dry_run_fires_nothing(self):
+        """DRY_RUN does the read-only /manualimport lookup (so the log shows what
+        would be imported) but never fires the ManualImport command."""
         with patch.object(media_automation, "DRY_RUN", True), \
+             patch.object(media_automation, "sonarr_get",
+                          side_effect=self._get([_sonarr_candidate()])), \
              patch.object(media_automation, "sonarr_post") as post:
-            # In DRY_RUN the resolver should never reach the manualimport lookup
-            # or the command; only the queue is paged.
-            def fake_get(path, *a, **k):
-                if path.startswith("/queue"):
-                    return {"records": [_record(messages=[BY_ID_MSG])], "totalRecords": 1}
-                raise AssertionError(f"DRY_RUN should not call: {path}")
-            with patch.object(media_automation, "sonarr_get", side_effect=fake_get):
+            with self.assertLogs(media_automation.log, level="INFO") as cm:
                 count = media_automation.resolve_blocked_imports()
         self.assertEqual(count, 0)
         post.assert_not_called()
+        self.assertTrue(any("DRY RUN: would import" in line for line in cm.output))
 
     def test_benign_records_skipped(self):
         def fake_get(path, *a, **k):

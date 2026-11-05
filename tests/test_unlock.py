@@ -305,8 +305,10 @@ class UnlockAndDownloadSeasonHelperTests(_Base):
                 "tester", eps, force_e02=False)
         put.assert_not_called()
         post.assert_not_called()
-        # Still marks unlocked + calls boost (boost itself honors DRY_RUN).
-        self.assertTrue(media_automation.is_season_unlocked(self.conn, self.SERIES_ID, 4))
+        # A dry run must leave no state behind (S38): recording the unlock would
+        # make the real run skip this season forever. Boost still runs (it
+        # honors DRY_RUN itself and only logs).
+        self.assertFalse(media_automation.is_season_unlocked(self.conn, self.SERIES_ID, 4))
         boost.assert_called_once()
 
 

@@ -9,11 +9,15 @@ Media Automation for Unraid
 
 import requests
 import json
+import re
 import time
 import os
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+from security_utils import clamp_retry_after, redact, redact_exception, same_host_redirect
 
 # ============================================================
 # LOGGING (must be before config so log is available)
@@ -24,6 +28,10 @@ logging.basicConfig(
     datefmt="%Y/%m/%d %H:%M:%S"
 )
 log = logging.getLogger("media-automation")
+# urllib3 logs every request line (query string included) at DEBUG, which would
+# put SABnzbd's ?apikey= and TMDB's ?api_key= into docker logs whenever
+# LOG_LEVEL=DEBUG. Keep it at WARNING regardless of LOG_LEVEL (S7).
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # ============================================================
 # CONFIGURATION (overridable via environment variables)
@@ -114,11 +122,12 @@ def _parse_retry_after(headers, default=60):
     retry loop, so fall back to the default for anything non-numeric.
     """
     raw = headers.get('Retry-After', default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        log.warning(f"Non-numeric Retry-After header '{raw}', using {default}s")
-        return default
+    seconds, numeric = clamp_retry_after(raw, default=default)
+    if not numeric:
+        log.warning(f"Non-numeric Retry-After header '{redact(raw)[:60]}', using {seconds}s")
+    # Clamped to [0, 120]: a hostile/buggy upstream can't make time.sleep() raise
+    # (negative/overflow) or stall the in-process playback loop for years (S9).
+    return seconds
 
 
 def _session_equivalent(method, session):
@@ -153,11 +162,30 @@ def _api_request_with_retry(method, url, headers, max_retries=3, session=None, *
     (the in-process playback loop). When session is None this is a no-op and the
     original module-level `requests` callable is used, preserving behavior for
     every other (subprocess) entrypoint.
+
+    Redirects are not followed automatically: requests would re-send our
+    X-Api-Key / X-Emby-Token header to whatever host a 3xx names. A redirect to
+    the same host (incl. an http->https upgrade) is followed once; anything else
+    is refused (S8). Every logged URL and every re-raised exception is redacted
+    (URL userinfo + query-string keys) so credentials never reach logs (S11).
     """
     http_call = _session_equivalent(method, session)
+    safe_url = redact(url)
     for attempt in range(max_retries):
         try:
-            resp = http_call(url, headers=headers, timeout=30, **kwargs)
+            resp = http_call(url, headers=headers, timeout=30, allow_redirects=False, **kwargs)
+
+            if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+                target = same_host_redirect(url, resp.headers["Location"])
+                if target is None:
+                    raise requests.exceptions.RequestException(
+                        f"refused cross-host redirect ({resp.status_code}) from {safe_url} "
+                        f"to {redact(resp.headers['Location'])[:200]} — set the service URL "
+                        f"to its final address")
+                resp = http_call(target, headers=headers, timeout=30, allow_redirects=False, **kwargs)
+                if 300 <= resp.status_code < 400:
+                    raise requests.exceptions.RequestException(
+                        f"too many redirects from {safe_url}")
 
             # Handle rate limiting
             if resp.status_code == 429:
@@ -179,25 +207,26 @@ def _api_request_with_retry(method, url, headers, max_retries=3, session=None, *
             try:
                 return resp.json()
             except json.JSONDecodeError:
-                log.error(f"Invalid JSON response from {url}: {resp.text[:200]}")
+                log.error(f"Invalid JSON response from {safe_url}: {redact(resp.text[:200])}")
                 return None
 
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as e:
             if attempt < max_retries - 1:
                 log.warning(f"Request timeout, retrying ({attempt + 1}/{max_retries})")
                 continue
-            log.error(f"Request timed out after {max_retries} attempts: {url}")
-            raise
-        except requests.exceptions.ConnectionError:
+            log.error(f"Request timed out after {max_retries} attempts: {safe_url}")
+            raise redact_exception(e)
+        except requests.exceptions.ConnectionError as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 log.warning(f"Connection error, retrying in {wait_time}s ({attempt + 1}/{max_retries})")
                 time.sleep(wait_time)
                 continue
-            log.error(f"Connection failed after {max_retries} attempts: {url}")
-            raise
+            log.error(f"Connection failed after {max_retries} attempts: {safe_url}")
+            raise redact_exception(e)
         except requests.exceptions.RequestException as e:
-            log.error(f"API request failed: {url} - {e}")
+            redact_exception(e)
+            log.error(f"API request failed: {safe_url} - {e}")
             raise
 
     return None
@@ -229,18 +258,26 @@ def radarr_post(endpoint, data, session=None):
 
 
 def sonarr_delete(endpoint):
-    """DELETE request to Sonarr API."""
+    """DELETE request to Sonarr API. No-op (logged) in DRY_RUN (S38)."""
     url = f"{SONARR_URL}/api/v3{endpoint}"
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would DELETE {redact(endpoint)} on Sonarr")
+        return None
     for attempt in range(3):
         try:
-            resp = requests.delete(url, headers=SONARR_HEADERS, timeout=30)
+            # No redirects: a 3xx would replay the DELETE + X-Api-Key elsewhere.
+            resp = requests.delete(url, headers=SONARR_HEADERS, timeout=30, allow_redirects=False)
+            if 300 <= resp.status_code < 400:
+                raise requests.exceptions.RequestException(
+                    f"refused redirect ({resp.status_code}) for DELETE {redact(url)}")
             resp.raise_for_status()
             return resp
         except requests.exceptions.RequestException as e:
             if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
-            log.error(f"DELETE request failed: {url} - {e}")
+            redact_exception(e)
+            log.error(f"DELETE request failed: {redact(url)} - {e}")
             raise
     return None
 
@@ -284,7 +321,7 @@ def sabnzbd_api(mode, params=None, session=None):
         # ?apikey=<SABNZBD_API_KEY> as a query param. Logging it verbatim leaks
         # the key into `docker logs`. Log only the exception type and the
         # query-stripped base URL instead.
-        log.error(f"SABnzbd API error (mode={mode}): {type(e).__name__} on {url}")
+        log.error(f"SABnzbd API error (mode={mode}): {type(e).__name__} on {redact(url)}")
         return None
 
 
@@ -307,6 +344,21 @@ def sabnzbd_set_priority(nzo_id, priority, session=None):
 # ============================================================
 # SEERR INTEGRATION
 # ============================================================
+# Seerr MediaRequestStatus: 1=PENDING, 2=APPROVED, 3=DECLINED, 4=FAILED,
+# 5=COMPLETED (newer Jellyseerr). Only requests an admin hasn't approved are
+# ignored; FAILED/COMPLETED were approved and still describe the wanted seasons.
+_SEERR_UNAPPROVED_STATUSES = {1, 3}
+
+
+def _seerr_request_counts(req):
+    """True unless the Seerr request is still PENDING or was DECLINED."""
+    status = req.get("status")
+    try:
+        return int(status) not in _SEERR_UNAPPROVED_STATUSES
+    except (TypeError, ValueError):
+        return True  # status missing/unknown: keep legacy behavior
+
+
 def get_requested_seasons_from_seerr(tvdb_id, title):
     """Query Seerr to find which seasons were actually requested for a series."""
     if not SEERR_API_KEY:
@@ -325,9 +377,10 @@ def get_requested_seasons_from_seerr(tvdb_id, title):
             log.warning("  No request data from Seerr")
             return None
 
-        # Find matching request by TVDB ID
+        # Find matching request by TVDB ID. PENDING/DECLINED requests are skipped:
+        # an unapproved request must not decide which seasons get downloaded (S10).
         for req in request_data["results"]:
-            if req.get("type") != "tv":
+            if req.get("type") != "tv" or not _seerr_request_counts(req):
                 continue
 
             media = req.get("media", {})
@@ -351,7 +404,7 @@ def get_requested_seasons_from_seerr(tvdb_id, title):
 
         # Also try matching by title if TVDB didn't match
         for req in request_data["results"]:
-            if req.get("type") != "tv":
+            if req.get("type") != "tv" or not _seerr_request_counts(req):
                 continue
 
             media = req.get("media", {})
@@ -541,6 +594,11 @@ def claim_series_for_processing(conn, sonarr_id, title):
     return True. If the existing row is 'done', or 'in_progress' and still
     fresh, we return False.
     """
+    if DRY_RUN:
+        # Dry runs must leave no state behind: a 'done'/'in_progress' row written
+        # here would stop the real run from ever setting the series up (S38).
+        log.info(f"  [DRY RUN] Would claim series '{title}' (ID: {sonarr_id}) for setup")
+        return True
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     with conn:
@@ -606,6 +664,9 @@ def _claim_is_stale(processed_at, now):
 
 def mark_series_done(conn, sonarr_id, title):
     """Flip a claimed series to status='done' after setup completes successfully."""
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would mark series '{title}' (ID: {sonarr_id}) as done")
+        return
     with conn:
         c = conn.cursor()
         c.execute(
@@ -621,6 +682,8 @@ def release_series_claim(conn, sonarr_id):
     than leaving it 'in_progress') lets the very next cycle re-claim immediately
     instead of waiting out STALE_CLAIM_MINUTES.
     """
+    if DRY_RUN:
+        return  # nothing was written by the dry-run claim
     try:
         with conn:
             c = conn.cursor()
@@ -647,7 +710,12 @@ def is_season_unlocked(conn, sonarr_id, season_number):
 
 
 def mark_season_unlocked(conn, sonarr_id, season_number, unlocked_by):
-    """Mark a season as fully unlocked."""
+    """Mark a season as fully unlocked. No-op in DRY_RUN (S38): a dry run that
+    recorded the unlock would make the real run skip the season forever."""
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] Would mark series {sonarr_id} season {season_number} "
+                 f"unlocked ({unlocked_by})")
+        return
     try:
         with conn:
             c = conn.cursor()
@@ -1087,6 +1155,10 @@ def cleanup_unwanted_queue_items(series_id, title):
 # Tracked-download states that indicate the item is held pending a manual
 # import decision (i.e. a real import block, not still downloading).
 _IMPORT_BLOCKED_STATES = {"importblocked", "importpending"}
+_BY_ID_RE = re.compile(r"\bmatched to (?:the )?(?:series|movie) by id\b")
+# Belt-and-braces sample detection on the file name, in addition to the *arr's
+# own "Sample" rejection.
+_SAMPLE_RE = re.compile(r"(?:^|[\W_])sample(?:[\W_]|$)", re.IGNORECASE)
 
 
 def _is_matched_by_id_block(record):
@@ -1101,12 +1173,11 @@ def _is_matched_by_id_block(record):
     if state not in _IMPORT_BLOCKED_STATES:
         return False
 
-    # Gather every status message string attached to the record.
+    # Gather the *arr-generated status message strings. statusMessages[].title is
+    # deliberately NOT included: it is the release / file name, which the
+    # uploader controls, so a crafted name must not be able to trip the gate (S16).
     messages = []
     for sm in record.get("statusMessages", []) or []:
-        title = sm.get("title")
-        if title:
-            messages.append(str(title))
         for m in sm.get("messages", []) or []:
             if m:
                 messages.append(str(m))
@@ -1114,11 +1185,10 @@ def _is_matched_by_id_block(record):
     if not blob:
         return False
 
-    # by-ID signature: "matched ... by ID" (Sonarr/Radarr phrasing) and/or the
-    # "Manual Import required" follow-up. Require the distinctive by-ID phrase so
-    # we don't fire on unrelated manual-import nudges.
-    matched_by_id = "matched" in blob and "by id" in blob
-    if not matched_by_id:
+    # by-ID signature, in the *arr's own phrasing: "...matched to series by ID"
+    # / "...matched to movie by ID". Require the exact phrase so we don't fire on
+    # unrelated manual-import nudges.
+    if not _BY_ID_RE.search(blob):
         return False
 
     # Explicitly steer clear of the benign cases even if some future message
@@ -1187,6 +1257,61 @@ def _build_radarr_import_file(candidate, download_id):
     return entry
 
 
+def _candidate_rejections(candidate):
+    """Human-readable rejection reasons the *arr attached to a candidate."""
+    reasons = []
+    for rej in candidate.get("rejections") or []:
+        if isinstance(rej, dict):
+            reasons.append(str(rej.get("reason") or rej.get("type") or "rejected"))
+        elif rej:
+            reasons.append(str(rej))
+    return reasons
+
+
+def _select_import_files(label, title, download_id, candidates, build_file_fn):
+    """Turn /manualimport candidates into a safe ManualImport `files` list.
+
+    Safeguards (S13/S15): a ManualImport command bypasses the *arr's own import
+    checks, so anything the *arr flagged is NOT forced through:
+      * candidates carrying any `rejections` (Sample, Not an upgrade, not in the
+        grabbed release, free space, ...) are skipped, with the reasons logged;
+      * sample files are skipped even if unflagged;
+      * if two remaining files map to the same movie or to an overlapping set of
+        episodes, the whole download is skipped — importing both would let the
+        later file silently replace the earlier one.
+    Returns the list of files to import ([] = nothing safe to do).
+    """
+    files = []
+    claimed = {}
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        path = str(cand.get("path") or "")
+        reasons = _candidate_rejections(cand)
+        if reasons:
+            log.info(f"  [{label}] '{title}': skipping {os.path.basename(path) or '?'} "
+                     f"— rejected by {label}: {'; '.join(reasons)[:200]}")
+            continue
+        if _SAMPLE_RE.search(os.path.basename(path)):
+            log.info(f"  [{label}] '{title}': skipping sample file {os.path.basename(path)}")
+            continue
+        entry = build_file_fn(cand, download_id)
+        if not entry:
+            continue
+        targets = ([("movie", entry["movieId"])] if "movieId" in entry
+                   else [("episode", eid) for eid in entry["episodeIds"]])
+        clash = next((claimed[t] for t in targets if t in claimed), None)
+        if clash is not None:
+            log.warning(f"  [{label}] '{title}': {os.path.basename(path)} and "
+                        f"{os.path.basename(clash)} map to the same {targets[0][0]} — "
+                        f"skipping this download; import it manually")
+            return []
+        for t in targets:
+            claimed[t] = path
+        files.append(entry)
+    return files
+
+
 def _resolve_blocked_imports(label, get_fn, post_fn, build_file_fn):
     """Shared blocked-queue -> manualimport -> ManualImport flow.
 
@@ -1194,10 +1319,17 @@ def _resolve_blocked_imports(label, get_fn, post_fn, build_file_fn):
     build_file_fn maps a manualimport candidate to a ManualImport `files` entry.
     Returns the number of import commands fired (0 in DRY_RUN). Pages the queue
     with the same pattern as cleanup_unwanted_queue_items.
+
+    Each downloadId is handled once per run: Sonarr lists a season pack as one
+    queue record per episode, and re-firing the same whole-pack ManualImport per
+    record would import it N times (S17). In DRY_RUN the read-only /manualimport
+    lookup still runs, so the log shows exactly which files would be imported and
+    which the safeguards would skip.
     """
     resolved = 0
     page = 1
     page_size = 100
+    seen_downloads = set()
 
     while True:
         try:
@@ -1219,17 +1351,17 @@ def _resolve_blocked_imports(label, get_fn, post_fn, build_file_fn):
                 continue
 
             download_id = record.get("downloadId")
-            title = record.get("title", "?")
+            title = str(record.get("title", "?"))[:200]
             if not download_id:
                 log.warning(f"  [{label}] by-ID block '{title}' has no downloadId; skipping")
                 continue
-
-            if DRY_RUN:
-                log.info(f"  [{label}] DRY RUN: would import by-ID block '{title}' (downloadId={download_id})")
+            download_id = str(download_id)
+            if download_id in seen_downloads:
                 continue
+            seen_downloads.add(download_id)
 
             try:
-                candidates = get_fn(f"/manualimport?downloadId={download_id}")
+                candidates = get_fn(f"/manualimport?downloadId={quote(download_id, safe='')}")
             except Exception as e:
                 log.warning(f"  [{label}] manualimport lookup failed for '{title}': {e}")
                 continue
@@ -1238,14 +1370,15 @@ def _resolve_blocked_imports(label, get_fn, post_fn, build_file_fn):
                 log.warning(f"  [{label}] no manualimport candidates for '{title}'; skipping")
                 continue
 
-            files = []
-            for cand in candidates:
-                entry = build_file_fn(cand, download_id)
-                if entry:
-                    files.append(entry)
-
+            files = _select_import_files(label, title, download_id, candidates, build_file_fn)
             if not files:
                 log.warning(f"  [{label}] '{title}' did not resolve to importable files; skipping")
+                continue
+
+            if DRY_RUN:
+                names = ", ".join(os.path.basename(str(f.get("path") or "?")) for f in files)
+                log.info(f"  [{label}] DRY RUN: would import by-ID block '{title}' "
+                         f"({len(files)} file(s): {names[:300]})")
                 continue
 
             try:
@@ -1326,6 +1459,14 @@ def _resolve_sonarr_series(series_name, series_jf_id, user_id, series_by_title, 
     sonarr_series = None
     title_lower = series_name.lower().strip()
 
+    # Ambiguous base title ("X" and "X (2003)" both in Sonarr): Jellyfin's
+    # SeriesName usually drops the year, so a bare-title match could pick the
+    # wrong show. Try the TVDB id first in that case (S19).
+    if _base_title(title_lower) in _ambiguous_base_titles(series_by_title):
+        by_tvdb = _lookup_series_by_tvdb(series_name, series_jf_id, user_id, series_by_tvdb)
+        if by_tvdb:
+            return by_tvdb
+
     match = series_by_title.get(title_lower)
     if match:
         if isinstance(match, list):
@@ -1340,17 +1481,54 @@ def _resolve_sonarr_series(series_name, series_jf_id, user_id, series_by_title, 
                 sonarr_series = match
 
     if not sonarr_series:
-        try:
-            jf_series_data = jellyfin_get(f"/Users/{user_id}/Items/{series_jf_id}")
-            tvdb_id = jf_series_data.get("ProviderIds", {}).get("Tvdb")
-            if tvdb_id:
-                sonarr_series = series_by_tvdb.get(int(tvdb_id))
-                if sonarr_series:
-                    log.debug(f"  Matched '{series_name}' via TVDB ID {tvdb_id}")
-        except Exception as e:
-            log.debug(f"  Could not get provider IDs for {series_name}: {e}")
+        sonarr_series = _lookup_series_by_tvdb(series_name, series_jf_id, user_id, series_by_tvdb)
 
     return sonarr_series
+
+
+def _lookup_series_by_tvdb(series_name, series_jf_id, user_id, series_by_tvdb):
+    """Resolve a Jellyfin series to Sonarr via its TVDB ProviderId, or None."""
+    try:
+        jf_series_data = jellyfin_get(f"/Users/{user_id}/Items/{series_jf_id}")
+        tvdb_id = (jf_series_data or {}).get("ProviderIds", {}).get("Tvdb")
+        if tvdb_id:
+            sonarr_series = series_by_tvdb.get(int(tvdb_id))
+            if sonarr_series:
+                log.debug(f"  Matched '{series_name}' via TVDB ID {tvdb_id}")
+            return sonarr_series
+    except Exception as e:
+        log.debug(f"  Could not get provider IDs for {series_name}: {e}")
+    return None
+
+
+_YEAR_SUFFIX_RE = re.compile(r"\s*\((?:19|20)\d{2}\)\s*$")
+_ambiguous_cache = {"key": None, "value": frozenset()}
+
+
+def _base_title(title_lower):
+    """'battlestar galactica (2003)' -> 'battlestar galactica'."""
+    return _YEAR_SUFFIX_RE.sub("", title_lower).strip()
+
+
+def _ambiguous_base_titles(series_by_title):
+    """Base titles shared by more than one Sonarr series (e.g. a bare-titled show
+    plus a year-suffixed remake). Memoized per index dict: the index is built
+    once per cycle and consulted for every Jellyfin series."""
+    key = (id(series_by_title), len(series_by_title))
+    if _ambiguous_cache["key"] != key:
+        counts = {}
+        for title_key, value in series_by_title.items():
+            n = len(value) if isinstance(value, list) else 1
+            base = _base_title(title_key)
+            counts[base] = counts.get(base, 0) + n
+        _ambiguous_cache["key"] = key
+        _ambiguous_cache["value"] = frozenset(b for b, n in counts.items() if n > 1)
+    return _ambiguous_cache["value"]
+
+
+def _fmt_num(value):
+    """Zero-padded episode/season number, or '??' when Jellyfin sends none."""
+    return f"{value:02d}" if isinstance(value, int) else "??"
 
 
 def unlock_and_download_season(conn, sonarr_id, season_number, series_name, unlocked_by,
@@ -2140,11 +2318,17 @@ def check_active_playback(conn, session=None, stop_event=None):
         # Must be E01
         ep_index = now_playing.get("IndexNumber")
         if ep_index != 1:
-            log.debug(f"  Playback detected: {jf_session.get('UserName', user_id)} playing {now_playing.get('SeriesName', '')} S{now_playing.get('ParentIndexNumber', 0):02d}E{ep_index:02d} (not E01, skipping)")
+            # Specials / unnumbered items carry IndexNumber/ParentIndexNumber of
+            # None; format defensively so one such session can't raise TypeError
+            # and abort the whole loop (S18).
+            log.debug(f"  Playback detected: {jf_session.get('UserName', user_id)} playing "
+                      f"{now_playing.get('SeriesName', '')} "
+                      f"S{_fmt_num(now_playing.get('ParentIndexNumber'))}E{_fmt_num(ep_index)} "
+                      f"(not E01, skipping)")
             continue
 
-        season_number = now_playing.get("ParentIndexNumber", 0)
-        if season_number == 0:
+        season_number = now_playing.get("ParentIndexNumber") or 0
+        if not isinstance(season_number, int) or season_number <= 0:
             continue
 
         series_name = now_playing.get("SeriesName", "")
@@ -2153,8 +2337,13 @@ def check_active_playback(conn, session=None, stop_event=None):
 
         log.info(f"  Playback detected: {user_name} playing {series_name} S{season_number:02d}E01")
 
-        # Match to Sonarr series
-        sonarr_series = series_by_title.get(series_name.lower().strip())
+        # Match to Sonarr series. When the title is ambiguous (Sonarr holds both
+        # "X" and "X (2003)", and Jellyfin's SeriesName drops the year) prefer the
+        # TVDB id so we don't unlock the wrong show (S19).
+        title_key = series_name.lower().strip()
+        sonarr_series = series_by_title.get(title_key)
+        if sonarr_series and _base_title(title_key) in _ambiguous_base_titles(series_by_title):
+            sonarr_series = None
 
         if not sonarr_series and series_jf_id:
             try:
@@ -2165,6 +2354,8 @@ def check_active_playback(conn, session=None, stop_event=None):
             except Exception:
                 pass
 
+        if not sonarr_series:
+            sonarr_series = series_by_title.get(title_key)  # TVDB lookup failed: fall back
         if not sonarr_series:
             log.debug(f"  '{series_name}' not found in Sonarr, skipping playback detection")
             continue
