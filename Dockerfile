@@ -9,15 +9,26 @@ WORKDIR /app
 # log visibility in Docker (docker logs) and Unraid's container log viewer.
 ENV PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir requests==2.34.0 tzdata==2026.2
+# Every runtime dependency (incl. requests' transitive deps) is pinned with a
+# hash, so a build can't silently pick up a new or tampered release (S36).
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir --require-hashes -r /app/requirements.txt
 
+COPY security_utils.py /app/
 COPY media_automation.py /app/
 COPY scheduler.py /app/
 COPY trakt_discovery.py /app/
 COPY taste_profile.py /app/
 
-# /data is the bind-mount target; chown so non-root user can write SQLite + tokens
-RUN mkdir -p /data && chown -R 99:100 /data /app
+# Byte-compile at build time so the read-only /app never needs __pycache__
+# writes at runtime.
+RUN python -m compileall -q /app
+
+# /data is the bind-mount target; chown it so the non-root user can write
+# SQLite + tokens. /app stays root-owned and read-only to the runtime user, so
+# a compromised process can't rewrite or shadow the code the scheduler keeps
+# re-executing (S6).
+RUN mkdir -p /data && chown -R 99:100 /data
 
 # Run as Unraid's nobody:users (matches /mnt/user/appdata ownership; no host chown needed)
 USER 99:100

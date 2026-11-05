@@ -36,6 +36,8 @@ When a new episode arrives for a season someone has been actively watching, it j
 
 Sonarr and Radarr sometimes park a perfectly good download in the queue with **"matched by ID — Manual Import required"**, waiting for a human to click Import. When `AUTO_IMPORT_BLOCKED` is `true` (the default), the script detects these blocked items each cycle and triggers the import automatically — Sonarr out of the box, and Radarr when `RADARR_URL`/`RADARR_API_KEY` are configured. Each instance is handled independently so a failure on one never blocks the other.
 
+Safeguards (v1.11.0): a manual import bypasses the *arr's own import checks, so the script never forces through a file the *arr itself rejected (Sample, "Not an upgrade", not in the grabbed release, …), skips sample files, and skips the whole download if two files would map to the same movie or episode (one would silently replace the other). Each download is imported once per cycle, even when Sonarr lists a season pack once per episode, and only the *arr's own "matched to series/movie by ID" message triggers it — never the release name. Run with `DRY_RUN=true` to see exactly which files would be imported.
+
 ## Trakt Content Discovery
 
 Automatically discovers trending, popular, and recommended content via the Trakt API and requests it through Seerr. TV shows request only Season 1 — the core automation's E01-preview logic handles progressive unlocking as people watch.
@@ -122,6 +124,9 @@ docker exec -e DRY_RUN=true -e TRAKT_LISTS=ai media-automation python -u /app/tr
 **Notes:**
 - A grounded call takes 10–30 s. If your cycle already runs near `TRAKT_SCRIPT_TIMEOUT` (default 300 s), raise it.
 - `DRY_RUN` skips Seerr requests and DB writes but still makes the real Gemini call (that's the point of the test) — repeated dry runs count against the grounded-call free-tier daily cap.
+- Rating/vote floors are hard floors: a title with no votes yet (rating 0) is skipped unless you set `AI_MIN_RATING=0` / `AI_MIN_VOTES=0` (or the global equivalents).
+
+**What is sent to Google (privacy):** each AI cycle sends one prompt containing, for the media types you have enabled only: recent watch history (title, year, genres, play count, last-watched *date*), the full do-not-suggest list (every title in Sonarr/Radarr, your entire Trakt watched history, and titles discovery has requested), Trakt/TMDB trending titles, and the platforms you block. With `AI_PROFILE=true` it also sends the distilled taste profile: genres, themes, actors/creators, typical runtimes, rewatches, the selected Jellyfin user's favorites and binged series, and — once your shared Trakt account has ≥10 ratings — titles rated 9–10 and ≤5. The exact text of the last prompt is saved as `ai_prompt_last.txt` next to the database. **Free (unpaid-tier) Gemini API keys:** per Google's Gemini API terms, prompts and responses on the unpaid tier may be retained, used to improve Google's products, and read by human reviewers. If that's not acceptable for your household's viewing data, use a paid (billing-enabled) key or leave `ai` out of `TRAKT_LISTS`.
 - Power-user options: add `ai` to `TRAKT_CROSS_LIST_SOURCES` to treat AI nominations as a "personal signal" in two-pass mode, or to `TRAKT_PREMIUM_BYPASS_LISTS` to let high-rated AI picks bypass year/status filters.
 - `TRAKT_LANGUAGES` is an API-level list parameter, so it doesn't constrain AI suggestions (the prompt hints at it, but it's soft). If language filtering matters to you, set `TMDB_ORIGINAL_LANGUAGE` — that's a hard filter that applies to AI picks too.
 
@@ -225,10 +230,17 @@ Sends a test alert and prints a per-channel delivery status (`✓`/`✗` for web
 
 ### 1. Configure Sonarr Webhook
 
+First pick a webhook secret and set it as `WEBHOOK_SECRET` in your `.env` (or the Unraid template), e.g. `openssl rand -hex 24`. **Since v1.11.0 webhooks are refused until it is set** — new series are still picked up by the regular poll, just up to `RUN_INTERVAL_MINUTES` later.
+
 In Sonarr, go to **Settings > Connect > Add > Webhook**:
 - **Name**: Media Automation
 - **URL**: `http://<your-server-ip>:9191`
+- **Method**: POST
+- **Username**: anything (e.g. `sonarr`)
+- **Password**: the same value as `WEBHOOK_SECRET`
 - **Events**: Check "On Series Add"
+
+Click **Test** — a 200 means the secret matches; 401 means it doesn't. (If your Sonarr version has no Username/Password fields, use the URL `http://<your-server-ip>:9191/?token=<WEBHOOK_SECRET>` instead.)
 
 ### 2. Disable Jellyseerr/Overseerr "Enable Automatic Search" on Sonarr
 
@@ -277,7 +289,7 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `SONARR_API_KEY` | | Sonarr API key |
 | `RADARR_URL` | | Radarr server URL (enables movie auto-import) |
 | `RADARR_API_KEY` | | Radarr API key (enables movie auto-import) |
-| `AUTO_IMPORT_BLOCKED` | `true` | Auto-resolve Sonarr/Radarr "matched by ID — Manual Import required" queue blocks (Radarr handling needs `RADARR_URL`/`RADARR_API_KEY`) — see [Matched-by-ID auto-import](#matched-by-id-auto-import) |
+| `AUTO_IMPORT_BLOCKED` | `true` | Auto-resolve Sonarr/Radarr "matched by ID — Manual Import required" queue blocks (Radarr handling needs `RADARR_URL`/`RADARR_API_KEY`). Files the *arr rejected (sample, not an upgrade, …) and ambiguous multi-file downloads are never forced — see [Matched-by-ID auto-import](#matched-by-id-auto-import) |
 | `JELLYFIN_URL` | Required | Jellyfin server URL |
 | `JELLYFIN_API_KEY` | | Jellyfin API key |
 | `SEERR_URL` | Required | Seerr server URL |
@@ -287,10 +299,13 @@ All configuration is done via the `.env` file. See `.env.example` for a template
 | `WATCH_THRESHOLD` | `0.75` | How much of a season must be watched before the next unlocks (0.75 = 75%) |
 | `RUN_INTERVAL_MINUTES` | `15` | How often the polling loop runs (in minutes) |
 | `NEW_SERIES_LOOKBACK_HOURS` | `48` | How far back to look for newly added series |
-| `DRY_RUN` | `false` | Set to `true` to log what would happen without making changes |
+| `DRY_RUN` | `false` | Set to `true` to log what would happen without making changes — no Sonarr/Seerr writes, no queue deletions, and no DB state (series stay unprocessed, so the real run still sets them up) |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `RUN_CATCHUP_ON_START` | `false` | Process all existing series on container start |
 | `WEBHOOK_PORT` | `9191` | Port for the webhook listener |
+| `WEBHOOK_SECRET` | *(required for webhooks)* | Shared secret Sonarr must send (webhook **Password** field, or `?token=` on the URL). Unset = webhooks refused (403); the poll still runs |
+| `MAX_WEBHOOK_CONNECTIONS` | `8` | Concurrent webhook connections; extra connections are dropped |
+| `MAX_PENDING_WEBHOOKS` | `50` | Distinct series waiting for a webhook worker; beyond this the server answers 503 and the poll picks the series up |
 | `SABNZBD_URL` | Required | SABnzbd server URL |
 | `SABNZBD_API_KEY` | | SABnzbd API key (required for download priority management) |
 | `INPROGRESS_BOOST_WINDOW_DAYS` | `7` | Weekly priority boost window. A new episode of a season you watched within this many days is bumped to High in SABnzbd. `0` = disabled. See [In-progress weekly priority boost](#in-progress-weekly-priority-boost) |
@@ -436,15 +451,9 @@ The easiest way to update is the bundled helper script, which pulls the latest c
 
 **Why not just `docker compose pull`?** `docker compose pull` updates only the container *image*. It does **not** touch the on-disk files in your checkout — `.env.example`, this `README.md`, the `docker-compose.yml`, and `CHANGELOG.md` all live in git, not the image. To get new env-var defaults, docs, and compose changes you need a `git pull` as well. `update.sh` does both:
 
-```bash
-#!/bin/bash
-set -e
-cd /mnt/user/appdata/media-automation
-git pull
-docker compose pull
-docker compose up -d --force-recreate
-docker image prune -f
-```
+- fetches upstream and shows the incoming commits;
+- **stops and shows the diff** if `docker-compose.yml` or `update.sh` itself changed upstream (they decide how the container — and this root-run script — execute), so you review them before re-running with `./update.sh --yes`;
+- fast-forwards the checkout (`git merge --ff-only`), then `docker compose pull`, `docker compose up -d --force-recreate`, `docker image prune -f`.
 
 If you prefer to do it by hand (image only, no on-disk file updates):
 
@@ -462,7 +471,7 @@ docker logs cascade-media --tail 20       # confirm no startup errors
 To pin to a specific version instead of `:latest`, edit the `image:` line in `docker-compose.yml`:
 
 ```yaml
-image: ghcr.io/normalee1993/cascade-media:v1.2.0
+image: ghcr.io/normalee1993/cascade-media:1.2.0
 ```
 
 Released versions and their changes are documented in [CHANGELOG.md](./CHANGELOG.md).
@@ -519,6 +528,18 @@ The SQLite database **and** the Trakt OAuth token live on the **host** data fold
 
 - **Keep the data dir on a cache-backed path, not the FUSE share.** Point `DATA_DIR` at a pool/cache-backed location (e.g. `/mnt/cache/appdata/cascade-media`) rather than the Unraid FUSE user share (`/mnt/user/...`). SQLite uses WAL mode, and WAL's memory-mapped locking can be flaky on `shfs`/FUSE, which can surface as intermittent "database is locked" or readonly errors — exactly the kind of write failure that can lose a rotated Trakt token. A cache/pool path avoids the FUSE layer entirely.
 
+## Security
+
+cascade-media holds full-admin API keys for Sonarr, Radarr, Seerr, Jellyfin and SABnzbd, so treat the container and its `/data` folder as sensitive.
+
+- **Webhook secret.** `WEBHOOK_SECRET` is required for webhooks (see [Setup](#1-configure-sonarr-webhook)). Without it anyone who can reach port 9191 — including a malicious web page opened on your LAN — could make the scheduler re-process arbitrary series. The listener also rejects non-JSON bodies, validates the series id, caps concurrent connections (`MAX_WEBHOOK_CONNECTIONS`) and queued series (`MAX_PENDING_WEBHOOKS`), and tears down connections after 30 s.
+- **Network.** API keys travel in request headers (SABnzbd's in the query string). Use `https://` URLs for any service outside your LAN; `validate` flags plain-`http://` URLs to public hosts. Redirects to another host are refused rather than followed with the key attached.
+- **Files.** The database (Trakt access + refresh tokens, viewing history) and the `ai_*.txt` artifacts are created group-only (`umask 007`; DB `0660`, artifacts `0640`). Don't share the appdata folder over SMB/NFS to untrusted users.
+- **Logs.** URLs and errors are redacted (API keys, tokens, `user:pass@` in URLs) even at `LOG_LEVEL=DEBUG`, and the full Gemini prompt is never logged — it is written to `ai_prompt_last.txt` instead.
+- **Container hardening.** `docker-compose.yml` (and the Unraid template's Extra Parameters) run the image read-only with `/tmp` as tmpfs, all capabilities dropped and `no-new-privileges`. The application code in `/app` is root-owned and not writable by the runtime user.
+- **Supply chain.** Python dependencies are hash-pinned in `requirements.txt`, the base image is digest-pinned, GitHub Actions are pinned to commit SHAs, and Dependabot proposes updates. `update.sh` refuses to apply upstream changes to `docker-compose.yml`/`update.sh` without review.
+- **AI discovery** sends your library and viewing history to Google — see the privacy note under [AI-Powered Discovery](#ai-powered-discovery-gemini).
+
 ## Troubleshooting
 
 **Show downloaded all seasons instead of just the requested one**
@@ -534,7 +555,7 @@ The SQLite database **and** the Trakt OAuth token live on the **host** data fold
 - Cause: the release name doesn't parse to the title in your library (e.g. `Battlestar.Galactica.2005.S02E01...` is stamped with the season's air-year and doesn't map to library entry `Battlestar Galactica (2003)`), so the *arr can only match by grab-history ID and refuses to auto-import as a safety measure. There is no "force import by ID" toggle in stable Sonarr/Radarr.
 - Manual fix: Activity → Queue → click the ⚠️ on the item → **Manual Import** → tick the file (series/episode are pre-filled) → **Import**.
 - Stop it re-grabbing the same offender: add a Release Profile *Must Not Contain* rule or a Custom Format that scores down the mis-named release group / wrong-year releases.
-- Automating this queue clean-up (scan for the "matched by ID" message → fire the manual import) is planned; not yet implemented.
+- Automatic: with `AUTO_IMPORT_BLOCKED=true` (default) the scheduler clears these itself each cycle — see [Matched-by-ID auto-import](#matched-by-id-auto-import). Items it skips (rejected files, samples, two files for one episode) are logged and still need the manual fix above.
 
 **Want to change what season is fully monitored**
 - Use the `reprocess` command after adjusting the request in Seerr.
@@ -546,7 +567,7 @@ The SQLite database **and** the Trakt OAuth token live on the **host** data fold
 
 **Got a "Trakt token refresh FAILED" or "Database readonly" alert email**
 - Check DB ownership: `stat /mnt/user/appdata/cascade-media/data/media_automation.db` — should be `uid=99 gid=100 mode=664`. If the container can't write to the DB, `save_tokens()` fails *after* Trakt has already rotated the refresh_token, locking you out until manual re-auth.
-- Fix permissions from the host: `docker exec --user root cascade-media chown 99:users /data/media_automation.db && docker exec --user root cascade-media chmod 664 /data/media_automation.db`
+- Fix permissions from the host: `docker exec --user root cascade-media chown 99:users /data/media_automation.db && docker exec --user root cascade-media chmod 660 /data/media_automation.db`
 - Re-authenticate (interactive, ~1 min): `docker exec cascade-media python -u /app/trakt_discovery.py auth`. Visit the URL it prints (`https://trakt.tv/activate`), enter the 8-character code, approve. The script saves the new tokens automatically.
 - Confirm with `docker exec -e DRY_RUN=true cascade-media python -u /app/trakt_discovery.py discover` — should show "Loaded N watched shows / N watched movies" with no readonly errors.
 **Container reports unhealthy** *(v1.2.0+)*

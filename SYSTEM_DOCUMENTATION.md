@@ -34,9 +34,12 @@ Sonarr → Settings → Connect → add a new **Webhook**:
 - **Name:** cascade-media (anything)
 - **URL:** `http://<cascade-media-host>:9191`
 - **Method:** POST
+- **Username / Password:** any username; the password must equal `WEBHOOK_SECRET` (v1.11.0+). Alternatively append `?token=<WEBHOOK_SECRET>` to the URL.
 - **Triggers:** check **On Series Add** only (the only event cascade-media handles)
 
-Without this, new series in Sonarr never trigger cascade-media's `process_new_series` and the cascade never runs.
+Without this, new series in Sonarr are only picked up by the next poll (`RUN_INTERVAL_MINUTES`). Without `WEBHOOK_SECRET` set, every webhook is answered 403 — same effect.
+
+Webhook server hardening (v1.11.0): auth checked before the body is read (401 wrong/missing secret, 403 none configured); `Content-Type: application/json` required (415 otherwise — blocks cross-site form posts); `series.id` must be a positive 32-bit int (400); already-queued ids are deduplicated and at most `MAX_PENDING_WEBHOOKS` (50) distinct series wait for a worker (503 beyond); at most `MAX_WEBHOOK_CONNECTIONS` (8) concurrent connections, each torn down after 30 s total; all logged fields are control-character-escaped and truncated.
 
 ### 2. Jellyseerr/Overseerr → "Enable Automatic Search" UNCHECKED
 
@@ -152,9 +155,11 @@ Entry point for the Docker container. Manages scheduling, concurrency, and the w
 | `RUN_INTERVAL_MINUTES` | 15 | Main polling interval |
 | `RUN_CATCHUP_ON_START` | true | Run catchup on startup |
 | `WEBHOOK_PORT` | 9191 | Sonarr webhook listener port |
+| `WEBHOOK_SECRET` | *(unset → webhooks refused)* | Shared secret Sonarr sends as Basic-auth password or `?token=` |
+| `MAX_WEBHOOK_CONNECTIONS` | 8 | Concurrent webhook connections |
+| `MAX_PENDING_WEBHOOKS` | 50 | Distinct queued webhook series before 503 |
 | `SCRIPT_TIMEOUT_MINUTES` | 30 | Poll/webhook script timeout |
 | `PLAYBACK_CHECK_INTERVAL` | 45 | Playback check interval (seconds) |
-| `PLAYBACK_SCRIPT_TIMEOUT` | 600 | Playback script timeout (seconds) |
 | `TRAKT_DISCOVERY_ENABLED` | false | Enable daily Trakt discovery |
 | `TRAKT_DISCOVERY_TIME` | 00:00 | Trakt run time (HH:MM, 24h) |
 | `TRAKT_DISCOVERY_TZ` | UTC | IANA timezone for scheduling |
@@ -165,8 +170,9 @@ Entry point for the Docker container. Manages scheduling, concurrency, and the w
 | Thread | Type | Lock | Purpose |
 |--------|------|------|---------|
 | Main | Main thread | `poll_lock` (non-blocking) | 15-min polling loop |
-| Webhook Server | Daemon | N/A | HTTPServer on port 9191 |
-| Playback Check | Daemon | `playback_lock` (non-blocking) | 45-sec playback detection |
+| Webhook Server | Daemon | N/A | BoundedThreadingHTTPServer on port 9191 (connection cap + per-connection deadline) |
+| Playback Check | Daemon | `playback_lock` (non-blocking) | 45-sec playback detection (in-process; stamps a heartbeat each iteration) |
+| Playback Watchdog | Daemon | N/A | Every 60 s: if no playback iteration finished within max(10× interval, 15 min), starts a fresh loop (the stale one exits if it wakes); `GET /` returns 503 while stalled |
 | Trakt Discovery | Daemon | `trakt_lock` (non-blocking) | Daily clock-based discovery |
 | Webhook Executor | ThreadPool(3) | `webhook_lock` (blocking) | Sequential webhook processing |
 
@@ -215,7 +221,7 @@ TV show download lifecycle: initial setup, watch progress monitoring, playback d
 | `NEW_SERIES_LOOKBACK_HOURS` | 24 | Hours to scan for new series |
 | `SABNZBD_QUEUE_WAIT_SECONDS` | 120 | Wait for downloads to appear in queue |
 | `DB_PATH` | /data/media_automation.db | Database location |
-| `DRY_RUN` | false | Log without making changes |
+| `DRY_RUN` | false | Log without making changes: no Sonarr/Seerr writes or queue deletes, and no DB state (claims, done, unlocked) |
 | `LOG_LEVEL` | INFO | Logging verbosity |
 
 ### CLI Commands
@@ -528,7 +534,7 @@ title TEXT, source TEXT, requested_at TEXT
 | `/api/v3/queue` | GET | Download queue |
 | `/api/v3/queue/{id}` | DELETE | Cancel download |
 
-> **Known limitation — "matched by ID" import blocks.** When a completed download's release name doesn't parse to a library title (e.g. `Battlestar.Galactica.2005.S02E01` vs `Battlestar Galactica (2003)`), Sonarr/Radarr can only match it via grab-history ID and refuses to auto-import as a safety measure (`importBlocked`/`importPending`, *"Automatic import is not possible / Manual Import required"*). There is no config toggle to force import-by-ID; today these require a manual import in Activity → Queue. Auto-resolving them from the scheduler (`GET /api/v3/manualimport?downloadId=` → `POST /api/v3/command {"name":"ManualImport"}`) is tracked in `project_backlog.md`.
+> **Known limitation — "matched by ID" import blocks.** When a completed download's release name doesn't parse to a library title (e.g. `Battlestar.Galactica.2005.S02E01` vs `Battlestar Galactica (2003)`), Sonarr/Radarr can only match it via grab-history ID and refuses to auto-import as a safety measure (`importBlocked`/`importPending`, *"Automatic import is not possible / Manual Import required"*). There is no config toggle to force import-by-ID. Since v1.8.0 the scheduler resolves them itself when `AUTO_IMPORT_BLOCKED=true` (`GET /api/v3/manualimport?downloadId=` → `POST /api/v3/command {"name":"ManualImport"}`). Since v1.11.0 it only acts on the *arr's own "matched to series/movie by ID" message (not the release name), skips candidates with any `rejections` and sample files, skips a download whose files map to the same movie/episode, and handles each downloadId once per run; DRY_RUN performs the read-only lookup and logs the files it would import.
 
 ### Jellyfin
 | Endpoint | Usage |

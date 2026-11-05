@@ -4,6 +4,44 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.11.0] - 2026-11-05
+
+Security and correctness release from a full-repo security review plus a review of v1.10.0: 41 security findings and 15 taste-profile findings, each confirmed by two independent verifiers. **One breaking change:** Sonarr webhooks now need a shared secret.
+
+### ⚠️ Breaking
+- **`WEBHOOK_SECRET` is required for webhooks.** Set it in the container env and put the same value in Sonarr → Settings → Connect → Webhook → **Password** (any username), or append `?token=<secret>` to the webhook URL. Until it is set every webhook gets a 403 and a startup error explains why; new series are still picked up by the regular poll (`RUN_INTERVAL_MINUTES`), just later.
+
+### Security
+- **Webhook server** (`scheduler.py`): authentication checked before the body is read; `Content-Type: application/json` required, which blocks cross-site `text/plain` form posts from a browser on your LAN; `series.id` validated; duplicate ids deduplicated and the queue bounded (`MAX_PENDING_WEBHOOKS`, 503 when full); concurrent connections capped (`MAX_WEBHOOK_CONNECTIONS`) with a whole-connection deadline, so slow-loris or header-heavy floods can't exhaust the 256 MB container; every logged field escaped and truncated (no forged log lines or terminal escapes).
+- **Secrets never reach logs or alerts:** URL userinfo (`user:pass@`) and `api_key` / `apikey` / `token` query values are redacted in every logged URL and in every exception the HTTP helpers re-raise, including the AI-failure webhook/email alert (previously the TMDB key). `urllib3` stays at WARNING even with `LOG_LEVEL=DEBUG`, and the full Gemini prompt is no longer logged (it is in `ai_prompt_last.txt`).
+- **Alert email TLS verifies the server certificate** (STARTTLS and implicit TLS). Before this, `SMTP_PASS` would be sent to anyone able to intercept the connection.
+- **API keys aren't forwarded on redirects:** requests to Sonarr, Radarr, Seerr, Jellyfin and TMDB follow a redirect only to the same host (http→https allowed); anything else is refused instead of re-sending `X-Api-Key` / `X-Emby-Token`.
+- **Files are no longer world-readable:** `umask 007` in every entrypoint, the DB and its WAL tightened to `0660` (it holds the Trakt refresh token), and AI artifacts written `0640` without following symlinks. The README's permission fix now says `chmod 660`.
+- **Auto-import safeguards** (`AUTO_IMPORT_BLOCKED`, still on by default): never forces a file Sonarr/Radarr rejected (Sample, Not an upgrade, …); skips sample files; skips a download whose files map to the same movie or episode; handles each downloadId once per run (a season pack used to fire one whole-pack import per episode); URL-encodes the downloadId; triggers only on the *arr's own "matched to series/movie by ID" message, not on the release name, which the uploader controls.
+- **Seerr:** PENDING and DECLINED requests no longer decide which seasons get monitored and searched.
+- **AI prompt injection:** titles, names and keywords from third parties are flattened to a single bounded line, and the data sections are labelled reference data, not instructions. The reply is deduplicated and capped at the requested counts, out-of-range or `Infinity` years and oversized numbers no longer break parsing, and punctuation-only or very short titles no longer prefix-match arbitrary Trakt results. Only the library and history of the media types you have enabled are sent.
+- **Retry-After** values from upstream services are clamped to 0–120 s, so a negative or huge value can no longer crash discovery or stall the playback loop.
+- **Playback loop watchdog:** a hung upstream request no longer stalls E01 unlocks forever. A stalled loop is replaced, and `GET /` (the HEALTHCHECK) returns 503 while it is stalled.
+- **Container and supply chain:** `/app` is root-owned and byte-compiled at build time; compose and the Unraid template run read-only with `/tmp` as tmpfs, `cap_drop: ALL` and `no-new-privileges`; dependencies are hash-pinned in a new `requirements.txt` (including requests' transitive deps); GitHub Actions are pinned to commit SHAs with workflow-level `contents: read`; Dependabot covers actions, the base-image digest and pip; `update.sh` fast-forwards only and refuses unreviewed upstream changes to `docker-compose.yml` / `update.sh` (re-run with `--yes`).
+- **Unraid template:** masked fields for `WEBHOOK_SECRET`, `GEMINI_API_KEY`, `RADARR_API_KEY`, `SMTP_USER` / `SMTP_PASS` and `ALERT_EMAIL_*`.
+
+### Changed (fail closed)
+- **Rating/vote floors** now reject titles with a missing or 0 rating or vote count whenever the floor is above 0. Set `AI_MIN_RATING=0` / `AI_MIN_VOTES=0` to let brand-new AI picks through.
+- **A content-rating allow-list** (`FILTER_CONTENT_RATINGS`) rejects titles with no certification. A block-list on its own still lets them through.
+- **TMDB unavailable:** when TMDB filters are configured but TMDB can't be reached, the title is deferred to the next cycle instead of being requested unfiltered. Nothing is recorded, so it is re-evaluated next time.
+- **DRY_RUN** now writes no state and deletes nothing. Previously a dry run marked series done and seasons unlocked, and cancelled queue items for real, so the real run never set those series up. Auto-import in DRY_RUN now does the read-only lookup and logs exactly which files it would import.
+
+### Fixed
+- **Taste profile:** one stale TMDB id (404) no longer disables the profile permanently; it is negative-cached, other failures count toward the 40-lookup cap, and three in a row stop the top-up. "Never watched" genres are judged on undecayed counts and only once there are at least 30 titles. Rewatches are deduplicated across Trakt and Jellyfin, a person counts once per title, TV combo genres count toward both halves of the lift baseline, and favorites and binges are ranked by recency. A ratings or baseline failure no longer drops the whole profile. `AI_PROFILE_HALF_LIFE_DAYS` below 1 falls back to 90. `ai_taste_profile.txt` is overwritten when there is no profile. TMDB trending is fetched once per cycle. Jellyfin signals are paged and limited to played items, so a big library can't run the container out of memory.
+- **Playback check** no longer aborts on an episode with no episode number (specials).
+- **Series matching:** shows with the same base title ("X" and "X (2003)") are resolved by TVDB id, so the wrong series is no longer unlocked.
+- **README:** the version-pin example uses the tags CI actually publishes (`:1.2.0`, not `:v1.2.0`). The docs now spell out exactly what AI discovery sends to Google and the data-use terms of free-tier Gemini keys.
+
+### Notes
+- SemVer: MINOR, with one documented breaking configuration requirement (`WEBHOOK_SECRET`). Polling keeps working without it.
+- New env: `WEBHOOK_SECRET`, `MAX_WEBHOOK_CONNECTIONS` (8), `MAX_PENDING_WEBHOOKS` (50).
+- `validate` now reports whether the webhook secret is set and flags plain-`http://` service URLs to hosts outside the LAN.
+
 ## [v1.10.0] - 2026-07-14
 
 Statistical taste profile for AI discovery: a locally computed, recency-weighted distillation of watch behavior added to the Gemini prompt alongside (not replacing) the raw history — the combination outperforms either alone per LLM-recommender research. Off by default (`AI_PROFILE=true` to enable).

@@ -12,6 +12,16 @@ services:
       - "${WEBHOOK_PORT:-9191}:${WEBHOOK_PORT:-9191}"
     env_file:
       - .env
+    # Defense in depth (S6): the root filesystem is read-only (only the /data
+    # volume and a small /tmp are writable), every Linux capability is dropped,
+    # and setuid binaries can't regain privileges.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ${DATA_DIR:-./data}:/data
     # Cap docker logs at ~50MB total (10MB x 5 files); prevents disk fill

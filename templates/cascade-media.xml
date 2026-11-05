@@ -13,7 +13,7 @@
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/normalee1993/cascade-media/main/templates/cascade-media.xml</TemplateURL>
   <Icon>https://cdn.jsdelivr.net/gh/normalee1993/cascade-media@main/logo.svg</Icon>
-  <ExtraParams/>
+  <ExtraParams>--read-only --tmpfs /tmp:size=16m --cap-drop=ALL --security-opt=no-new-privileges:true</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
@@ -65,6 +65,8 @@
   <Config Name="Watch Threshold" Target="WATCH_THRESHOLD" Default="0.75" Mode="" Description="Fraction of a season that must be watched before the next season unlocks automatically. 0.75 = 75%." Type="Variable" Display="always" Required="false" Mask="false">0.75</Config>
 
   <Config Name="Poll Interval (minutes)" Target="RUN_INTERVAL_MINUTES" Default="15" Mode="" Description="How often the watch-progress polling loop runs, in minutes." Type="Variable" Display="always" Required="false" Mask="false">15</Config>
+
+  <Config Name="Webhook Secret" Target="WEBHOOK_SECRET" Default="" Mode="" Description="REQUIRED for webhooks (v1.11.0+). A long random string; put the same value in Sonarr > Settings > Connect > Webhook > Password (any Username). Webhooks are refused until it is set; new series are then picked up by the regular poll instead. Generate one with: openssl rand -hex 24" Type="Variable" Display="always" Required="true" Mask="true"></Config>
 
   <Config Name="Webhook Port (env)" Target="WEBHOOK_PORT" Default="9191" Mode="" Description="Must match the Webhook Port mapping above. Change both together if you use a different port." Type="Variable" Display="always" Required="false" Mask="false">9191</Config>
 
@@ -183,5 +185,23 @@
   <!-- ═══════════════════════════════════════════════════════════════ -->
 
   <Config Name="Alert Webhook URL" Target="ALERT_WEBHOOK_URL" Default="" Mode="" Description="Optional Discord or Slack webhook URL. Fires ONLY on Trakt token refresh failure requiring manual re-authentication. Routine expiry warnings go to the container log only." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Alert Email (SMTP) User" Target="SMTP_USER" Default="" Mode="" Description="Optional SMTP username for alert emails (e.g. your Gmail address). See .env.example for SMTP_HOST / SMTP_PORT / SMTP_USE_TLS." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Alert Email (SMTP) Password" Target="SMTP_PASS" Default="" Mode="" Description="Optional SMTP password / Gmail App Password for alert emails. The server certificate is verified." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Alert Email To" Target="ALERT_EMAIL_TO" Default="" Mode="" Description="Optional recipient address for alert emails." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Alert Email From" Target="ALERT_EMAIL_FROM" Default="" Mode="" Description="Optional sender address for alert emails." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- OPTIONAL INTEGRATIONS                                           -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <Config Name="Radarr URL" Target="RADARR_URL" Default="" Mode="" Description="Optional. Enables matched-by-ID auto-import for movies (e.g. http://radarr:7878)." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Radarr API Key" Target="RADARR_API_KEY" Default="" Mode="" Description="Optional Radarr API key (Settings > General > API Key)." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Gemini API Key" Target="GEMINI_API_KEY" Default="" Mode="" Description="Optional. Enables the 'ai' discovery source (add 'ai' to TRAKT_LISTS). Your watch history and library titles are sent to Google Gemini — see the README's AI discovery privacy notes before enabling." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
 
 </Container>

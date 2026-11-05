@@ -1,0 +1,25 @@
+# Keeps pinned dependencies current (S34/S36): action SHAs, the digest-pinned
+# python base image (so Debian/CPython security fixes reach :latest), and the
+# hash-pinned requirements.txt. Each update arrives as a PR that runs the tests.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-deps:
+        patterns: ["*"]
