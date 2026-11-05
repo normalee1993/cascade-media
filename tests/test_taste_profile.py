@@ -57,7 +57,9 @@ class ComputeProfileTests(unittest.TestCase):
         self.assertEqual(profile["genres"][0][0], "crime")
 
     def test_avoided_genres_lists_absent_majors_only(self):
-        watched = {"movie": [_watched("movie", "M", genres=("horror",))], "show": []}
+        watched = {"movie": [_watched("movie", f"M{i}", genres=("horror",))
+                             for i in range(taste_profile.MIN_TITLES_FOR_AVOIDED)],
+                   "show": []}
         profile = taste_profile.compute_profile(watched, {}, None, now=NOW)
         self.assertNotIn("horror", profile["avoided_genres"])
         self.assertIn("reality", profile["avoided_genres"])
@@ -257,8 +259,10 @@ class GenreLiftTests(unittest.TestCase):
                 return {"results": [{"genre_ids": [80, 18]}]}  # crime, drama
             return {"results": [{"genre_ids": [10765]}]}       # tv sci-fi&fantasy
         base = taste_profile.trending_genre_baseline(fake_tmdb)
-        self.assertAlmostEqual(base["crime"], 1/3)
-        self.assertAlmostEqual(base["science fiction"], 1/3)
+        # TV "Sci-Fi & Fantasy" counts toward both halves (R9): 4 mentions.
+        self.assertAlmostEqual(base["crime"], 1/4)
+        self.assertAlmostEqual(base["science fiction"], 1/4)
+        self.assertAlmostEqual(base["fantasy"], 1/4)
 
 
 class JellyfinSignalsTests(unittest.TestCase):

@@ -17,7 +17,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from security_utils import clamp_retry_after, redact, redact_exception, same_host_redirect
+from security_utils import (clamp_retry_after, redact, redact_exception, same_host_redirect,
+                            tighten_file_mode)
 
 # ============================================================
 # LOGGING (must be before config so log is available)
@@ -470,6 +471,8 @@ def init_db():
             # Set busy_timeout BEFORE journal_mode to handle concurrent access
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA journal_mode=WAL")
+            # The DB holds Trakt tokens + viewing history: never world-readable (S25).
+            tighten_file_mode(DB_PATH)
 
             c = conn.cursor()
             # ---- processed_series schema + status migration (Item 2) -------------
@@ -2589,6 +2592,10 @@ def run_list():
 
 if __name__ == "__main__":
     import sys
+
+    # Created files (DB, WAL) must not be world-readable, also when this script is
+    # run directly via `docker exec` rather than under the scheduler (S25).
+    os.umask(0o007)
 
     if len(sys.argv) > 1:
         if sys.argv[1] == "catchup":

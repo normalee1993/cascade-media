@@ -86,6 +86,38 @@ def same_host_redirect(url, location):
     return target
 
 
+def tighten_file_mode(path, mode=0o660):
+    """Best-effort chmod of a file and its SQLite WAL/SHM side files.
+
+    The DB holds the Trakt access + refresh tokens and household viewing data;
+    files created before v1.11.0 (or under a permissive umask) may be 0644.
+    Group stays rw so Unraid's 'users' group keeps access. Never raises.
+    """
+    import os
+
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        try:
+            if os.path.isfile(candidate) and (os.stat(candidate).st_mode & 0o777) != mode:
+                os.chmod(candidate, mode)
+        except OSError:
+            pass
+
+
+def write_private_file(path, text, mode=0o640):
+    """Write text to `path` without following a pre-planted symlink, with the
+    file created as `mode` (not world-readable). Raises OSError on failure."""
+    import os
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        os.fchmod(fd, mode)
+    except (AttributeError, OSError):
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def safe_log(value, maxlen=200):
     """Render an untrusted value for a single log line.
 
